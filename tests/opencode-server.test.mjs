@@ -4,7 +4,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { autoHealJob } from "../plugins/opencode/scripts/lib/auto-heal.mjs";
-import { validateModel } from "../plugins/opencode/scripts/lib/opencode-server.mjs";
+import { formatModel, validateModel } from "../plugins/opencode/scripts/lib/opencode-server.mjs";
 import { jobDataPath, loadState, updateState, upsertJob } from "../plugins/opencode/scripts/lib/state.mjs";
 import { createTmpDir, cleanupTmpDir } from "./helpers.mjs";
 import { serveV2 } from "./v2-fixture.mjs";
@@ -143,4 +143,10 @@ test("model validation names the bad part and skips when the list is unavailable
   await assert.rejects(validateModel(client, "no-slash"), /Invalid model "no-slash"/);
   const unavailable = await serveV2(t, { models: null });
   await validateModel(unavailable.client, "anything/goes");
+});
+
+test("formatModel round-trips --model text and hides the implicit default variant", () => {
+  assert.equal(formatModel({ providerID: "deepseek", id: "deepseek-flash", variant: "default" }), "deepseek/deepseek-flash");
+  assert.equal(formatModel({ providerID: "vendor", id: "model/name", variant: "high" }), "vendor/model/name#high");
+  assert.equal(formatModel(undefined), null);
 });

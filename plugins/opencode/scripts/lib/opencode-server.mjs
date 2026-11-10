@@ -62,13 +62,15 @@ export function parseModel(model) {
 }
 
 /**
- * Format a V2 model reference as "provider/model#variant".
+ * Format a V2 model reference as "provider/model#variant". The server's
+ * implicit "default" variant is left out: it cannot be passed back as --model.
  * @param {{ providerID?: string, id?: string, variant?: string }|undefined|null} ref
  * @returns {string|null}
  */
 export function formatModel(ref) {
   if (!ref?.providerID || !ref?.id) return null;
-  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ""}`;
+  const variant = ref.variant && ref.variant !== "default" ? `#${ref.variant}` : "";
+  return `${ref.providerID}/${ref.id}${variant}`;
 }
 
 /**
