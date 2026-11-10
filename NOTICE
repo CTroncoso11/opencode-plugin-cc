@@ -8,4 +8,10 @@ The architecture, plugin structure, and command patterns are derived from the
 original codex-plugin-cc project, adapted to work with OpenCode
 (https://github.com/anomalyco/opencode) instead of Codex.
 
+This fork (https://github.com/CTroncoso11/opencode-plugin-cc) is maintained by
+Cristian Troncoso and contains modifications to armedi/opencode-plugin-cc
+(https://github.com/armedi/opencode-plugin-cc), itself based on
+tasict/opencode-plugin-cc (https://github.com/tasict/opencode-plugin-cc).
+Modifications copyright 2026 Cristian Troncoso.
+
 Licensed under the Apache License, Version 2.0.

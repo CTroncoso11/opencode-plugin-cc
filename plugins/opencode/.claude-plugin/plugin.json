@@ -1,8 +1,12 @@
 {
   "name": "opencode",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Use OpenCode V2 from Claude Code to review code or delegate tasks.",
   "author": {
-    "name": "OpenCode Community"
-  }
+    "name": "Cristian Troncoso",
+    "url": "https://github.com/CTroncoso11"
+  },
+  "homepage": "https://github.com/CTroncoso11/opencode-plugin-cc",
+  "repository": "https://github.com/CTroncoso11/opencode-plugin-cc",
+  "license": "Apache-2.0"
 }

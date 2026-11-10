@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Marketplace preparation for opencode-plugin-cc (install explicitly in Claude Code)
 # Usage (inside Claude Code):
-#   ! curl -fsSL https://raw.githubusercontent.com/armedi/opencode-plugin-cc/main/install.sh | bash
+#   ! curl -fsSL https://raw.githubusercontent.com/CTroncoso11/opencode-plugin-cc/main/install.sh | bash
 #
 # Or clone + run locally:
-#   ! bash <(curl -fsSL https://raw.githubusercontent.com/armedi/opencode-plugin-cc/main/install.sh)
+#   ! bash <(curl -fsSL https://raw.githubusercontent.com/CTroncoso11/opencode-plugin-cc/main/install.sh)
 
 set -euo pipefail
 
-REPO="armedi/opencode-plugin-cc"
+REPO="CTroncoso11/opencode-plugin-cc"
 PLUGIN_NAME="opencode"
-MARKETPLACE_NAME="armedi-opencode-plugin-cc"
+MARKETPLACE_NAME="ctroncoso-opencode-plugin-cc"
 BRANCH="main"
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"

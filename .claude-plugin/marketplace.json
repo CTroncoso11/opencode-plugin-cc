@@ -1,19 +1,24 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "armedi-opencode-plugin-cc",
-  "version": "2.0.0",
-  "description": "OpenCode plugins to use in Claude Code for delegation and code review.",
+  "name": "ctroncoso-opencode-plugin-cc",
+  "version": "2.1.0",
+  "description": "OpenCode V2 plugin for Claude Code: delegate tasks and run code reviews with OpenCode.",
   "owner": {
-    "name": "OpenCode Community"
+    "name": "Cristian Troncoso",
+    "url": "https://github.com/CTroncoso11"
   },
   "plugins": [
     {
       "name": "opencode",
-      "description": "Use OpenCode from Claude Code to review code or delegate tasks.",
-      "version": "2.0.0",
+      "description": "Use OpenCode V2 from Claude Code to review code or delegate tasks.",
+      "version": "2.1.0",
       "author": {
-        "name": "OpenCode Community"
+        "name": "Cristian Troncoso",
+        "url": "https://github.com/CTroncoso11"
       },
+      "homepage": "https://github.com/CTroncoso11/opencode-plugin-cc",
+      "repository": "https://github.com/CTroncoso11/opencode-plugin-cc",
+      "license": "Apache-2.0",
       "source": "./plugins/opencode",
       "category": "development"
     }

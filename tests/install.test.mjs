@@ -9,14 +9,14 @@ test("installer prepares the marketplace without installing or enabling plugins,
   const home = createTmpDir("opencode-install");
   t.after(() => cleanupTmpDir(home));
   const config = path.join(home, ".claude");
-  const marketplace = path.join(config, "plugins/marketplaces/armedi-opencode-plugin-cc");
+  const marketplace = path.join(config, "plugins/marketplaces/ctroncoso-opencode-plugin-cc");
   fs.mkdirSync(marketplace, { recursive: true });
   fs.cpSync(".claude-plugin", path.join(marketplace, ".claude-plugin"), { recursive: true });
   fs.cpSync("plugins", path.join(marketplace, "plugins"), {
     recursive: true,
     filter: (source) => !source.split(path.sep).includes("node_modules"),
   });
-  const pluginID = "opencode@armedi-opencode-plugin-cc";
+  const pluginID = "opencode@ctroncoso-opencode-plugin-cc";
   const settingsPath = path.join(config, "settings.json");
   const installedPath = path.join(config, "plugins/installed_plugins.json");
   const cachePath = path.join(config, "plugins/cache");
@@ -42,8 +42,8 @@ test("installer prepares the marketplace without installing or enabling plugins,
       assert.deepEqual(fs.readdirSync(cachePath), ["existing"]);
     }
     const marketplaces = JSON.parse(fs.readFileSync(path.join(config, "plugins/known_marketplaces.json"), "utf8"));
-    assert.equal(marketplaces["armedi-opencode-plugin-cc"].installLocation, marketplace);
-    assert.match(result.stdout, /\/plugin install opencode@armedi-opencode-plugin-cc/);
+    assert.equal(marketplaces["ctroncoso-opencode-plugin-cc"].installLocation, marketplace);
+    assert.match(result.stdout, /\/plugin install opencode@ctroncoso-opencode-plugin-cc/);
     if (attempt === 0) {
       fs.writeFileSync(installedPath, '{"version":2,"plugins":{"other@marketplace":[]}}\n');
       fs.mkdirSync(cachePath);

@@ -1,9 +1,17 @@
 # OpenCode V2 plugin for Claude Code
 
 Use OpenCode from inside Claude Code for code reviews or to delegate tasks.
-This fork of [tasict/opencode-plugin-cc](https://github.com/tasict/opencode-plugin-cc)
-targets **OpenCode V2** and is tested against **2.2.5** (client `@opencode/client` 2.2.6). V1 is not supported by
-this version; use the upstream project for V1.
+
+Maintained by [Cristian Troncoso](https://github.com/CTroncoso11) at
+[CTroncoso11/opencode-plugin-cc](https://github.com/CTroncoso11/opencode-plugin-cc).
+It continues [armedi/opencode-plugin-cc](https://github.com/armedi/opencode-plugin-cc)
+(the OpenCode V2 port of [tasict/opencode-plugin-cc](https://github.com/tasict/opencode-plugin-cc)),
+with safe prompt passing on Windows, `--cwd` and `--prompt-file`, job lookup by ID,
+model defaults and validation, a Bun-or-Node launcher and cross-platform tests.
+
+It targets **OpenCode V2** and is tested against **2.2.5** (client
+`@opencode/client` 2.2.6) on Windows (Git Bash), with simulated macOS and Linux
+tests. V1 is not supported; use tasict's project for V1.
 
 > **Tribute:** Inspired by [codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
 > by OpenAI. Its architecture, command structure, and design patterns were adapted
@@ -29,53 +37,98 @@ npm install -g @opencode/cli
 opencode --version
 ```
 
-## Install this fork
+## Plugin marketplace
 
-Inside Claude Code:
+This repository is a Claude Code **plugin marketplace** with one plugin.
 
-```bash
-! curl -fsSL https://raw.githubusercontent.com/armedi/opencode-plugin-cc/main/install.sh | bash
-```
+| Item | Value |
+| --- | --- |
+| Marketplace name | `ctroncoso-opencode-plugin-cc` |
+| Marketplace source | GitHub `CTroncoso11/opencode-plugin-cc` (branch `main`) |
+| Manifest | [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) |
+| Plugin | `opencode` (folder `plugins/opencode`, manifest `plugins/opencode/.claude-plugin/plugin.json`) |
+| Plugin ID | `opencode@ctroncoso-opencode-plugin-cc` |
+| Commands | `/opencode:delegate`, `/opencode:review`, `/opencode:status`, `/opencode:result`, `/opencode:cancel`, `/opencode:setup` |
 
-The script clones this fork, prepares its locked V2 client dependencies in the
-marketplace source, and registers the marketplace. It tries SSH first, then HTTPS.
-It does **not** install or enable the plugin, populate Claude Code's plugin cache,
-or change `installed_plugins.json` or `settings.json`.
+### Install
 
-If the upstream plugin is installed, uninstall it first to avoid duplicate
-commands and hooks:
-
-```text
-/plugin uninstall opencode@tasict-opencode-plugin-cc
-```
-
-Install the plugin in Claude Code:
+The same steps work on macOS, Linux and Windows. Inside Claude Code:
 
 ```text
-/plugin install opencode@armedi-opencode-plugin-cc
-```
-
-Choose your installation scope in the plugin panel (for example,
-**Install for you (user scope)**). Then reload and verify:
-
-```text
+/plugin marketplace add CTroncoso11/opencode-plugin-cc
+/plugin install opencode@ctroncoso-opencode-plugin-cc
 /reload-plugins
 /opencode:setup
 ```
 
-If the plugin is already installed but disabled, enable it from the **Installed** tab (or run
-`/plugin enable opencode@armedi-opencode-plugin-cc`). Then run `/reload-plugins`
-and `/opencode:setup`. The marketplace was already registered by the installer;
-if Claude Code cannot find it, add it with
-`/plugin marketplace add armedi/opencode-plugin-cc` first.
+Choose the installation scope in the plugin panel (for example,
+**Install for you (user scope)**). `/opencode:setup` checks OpenCode, its
+service and its providers.
 
-For a fuller diagnostic:
+From the terminal, outside a session, the same steps are:
 
 ```bash
-sh ~/.claude/plugins/cache/armedi-opencode-plugin-cc/opencode/2.0.0/scripts/run.sh doctor
+claude plugin marketplace add CTroncoso11/opencode-plugin-cc
+claude plugin install opencode@ctroncoso-opencode-plugin-cc
 ```
 
-Delegate a task:
+Alternative: the installer script clones the marketplace, prepares the locked
+`@opencode/client` dependency with npm and registers the marketplace (SSH first,
+then HTTPS). It does **not** install or enable the plugin.
+
+```bash
+! curl -fsSL https://raw.githubusercontent.com/CTroncoso11/opencode-plugin-cc/main/install.sh | bash
+```
+
+Then run `/plugin install opencode@ctroncoso-opencode-plugin-cc` and `/reload-plugins`.
+
+### Install from a local clone
+
+Use this to test changes before you push them:
+
+```bash
+git clone git@github.com:CTroncoso11/opencode-plugin-cc.git
+cd opencode-plugin-cc
+npm --prefix plugins/opencode ci --omit=dev --ignore-scripts --workspaces=false
+claude plugin marketplace add "$(pwd)"
+claude plugin install opencode@ctroncoso-opencode-plugin-cc
+```
+
+Then run `/reload-plugins` in Claude Code.
+
+### Update
+
+```text
+/plugin marketplace update ctroncoso-opencode-plugin-cc
+/plugin update opencode@ctroncoso-opencode-plugin-cc
+/reload-plugins
+```
+
+### Move from armedi's or tasict's marketplace
+
+Remove the old plugin and marketplace first, so the commands and hooks are not
+loaded twice:
+
+```text
+/plugin uninstall opencode@armedi-opencode-plugin-cc
+/plugin marketplace remove armedi-opencode-plugin-cc
+/plugin uninstall opencode@tasict-opencode-plugin-cc
+/plugin marketplace remove tasict-opencode-plugin-cc
+```
+
+Then install as above. Old jobs stay in the plugin data folder; jobs made by
+the old version are found with `--cwd` only.
+
+### Diagnose
+
+```bash
+sh ~/.claude/plugins/cache/ctroncoso-opencode-plugin-cc/opencode/*/scripts/run.sh doctor
+```
+
+If the plugin is installed but disabled, enable it from the **Installed** tab (or run
+`/plugin enable opencode@ctroncoso-opencode-plugin-cc`), then `/reload-plugins`.
+
+### Use
 
 ```text
 /opencode:delegate grep for XXX in src/ and summarize
@@ -84,9 +137,18 @@ Delegate a task:
 ### Uninstall
 
 ```text
-/plugin uninstall opencode@armedi-opencode-plugin-cc
+/plugin uninstall opencode@ctroncoso-opencode-plugin-cc
+/plugin marketplace remove ctroncoso-opencode-plugin-cc
 /reload-plugins
 ```
+
+### Release a new version
+
+1. Raise `version` in `.claude-plugin/marketplace.json` (marketplace and plugin
+   entry), `plugins/opencode/.claude-plugin/plugin.json`, `package.json` and
+   `plugins/opencode/package.json` (and their lockfiles).
+2. Run `npm test`, `npm run test:bun` and `claude plugin validate .`.
+3. Push to `main`. Users run the update steps above.
 
 ## Commands
 
@@ -230,12 +292,13 @@ The old V1 idle/pgrep/strict-terminal environment settings are no longer used.
   `opencode service start`. For an unhealthy service, use
   `opencode service restart`.
 - **No providers:** open OpenCode and use `/connect`, then rerun setup.
-- **Missing `@opencode/client`:** rerun this fork's installer. A manually copied
-  plugin needs `npm ci --omit=dev --ignore-scripts --workspaces=false` in its root.
+- **Missing `@opencode/client`:** run
+  `npm ci --omit=dev --ignore-scripts --workspaces=false` in the plugin folder
+  (`plugins/opencode` of the marketplace, or the cached copy), or rerun the installer.
 - **Permission requested:** configure a narrow V2 `permissions` rule for the
   reported action/resource; the companion deliberately does not auto-approve.
-- **Plugin not loading:** rerun the script, explicitly run
-  `/plugin install opencode@armedi-opencode-plugin-cc`, then `/reload-plugins`.
+- **Plugin not loading:** run
+  `/plugin install opencode@ctroncoso-opencode-plugin-cc`, then `/reload-plugins`.
   Restart Claude Code if necessary.
 
 V2 reads global `~/.config/opencode/opencode.json(c)` (or `$XDG_CONFIG_HOME`)
@@ -257,6 +320,7 @@ the cached Claude Code plugin can run independently of this repository.
 
 ## License
 
-Copyright 2026 OpenCode Plugin Contributors.
+Copyright 2026 OpenCode Plugin Contributors; modifications copyright 2026
+Cristian Troncoso.
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
 [NOTICE](NOTICE) for the license and attribution notices.
