@@ -1,33 +1,49 @@
 #!/usr/bin/env node
 
-// OpenCode Companion - Main entry point for the Claude Code plugin.
-// Mirrors the codex-plugin-cc codex-companion.mjs architecture but uses
-// OpenCode's HTTP REST API instead of JSON-RPC over stdin/stdout.
+// OpenCode Companion - CLI entry point for the Claude Code plugin.
+// Talks to OpenCode's V2 HTTP API through the released client.
+//
+// Every subcommand accepts --cwd <dir> (alias --workspace <dir>) to choose
+// the workspace instead of the process working directory.
+//
+// Exit codes: 0 ok, 1 failed (job or OpenCode error), 2 job still running,
+// 3 usage error, 4 job not found or ambiguous.
 
 import path from "node:path";
 import process from "node:process";
 import fs from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 
-import { parseArgs, extractTaskText } from "./lib/args.mjs";
-import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
-import { isServerRunning, discoverServer, connect, extractResponseText } from "./lib/opencode-server.mjs";
+import { parseArgs, readPrompt, workspaceOption } from "./lib/args.mjs";
+import { EXIT, CompanionError, usageError, oneLine } from "./lib/errors.mjs";
+import { resolveOpencodeBinary, getOpencodeVersion, spawnDetached, runCommand, isProcessAlive } from "./lib/process.mjs";
+import {
+  isServerRunning, discoverServer, connect, extractResponseText,
+  parseModel, formatModel, validateModel,
+} from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
-import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
+import { snapshotWorktree, worktreeChanges } from "./lib/git.mjs";
+import {
+  loadState, updateState, upsertJob, jobDataPath, jobLogPath, stateRoot,
+  loadPluginConfig, updatePluginConfig,
+} from "./lib/state.mjs";
+import {
+  buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, locateJob,
+  isActiveJob, latestTaskSession, toJobView,
+} from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderNativeReview, renderSetup } from "./lib/render.mjs";
 import { readJson } from "./lib/fs.mjs";
-import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-heal.mjs";
-import { stateRoot } from "./lib/state.mjs";
-import { runCommand } from "./lib/process.mjs";
+import { autoHealJobs, healableJobs, getSessionLastActivity } from "./lib/auto-heal.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
+const COMPANION_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs");
+const STATUS_SCHEMA_VERSION = 1;
+const MODEL_ENV = "OPENCODE_PLUGIN_MODEL";
 
 // ------------------------------------------------------------------
 // Subcommand dispatch
 // ------------------------------------------------------------------
-
-const [subcommand, ...argv] = process.argv.slice(2);
 
 const handlers = {
   setup: handleSetup,
@@ -44,28 +60,154 @@ const handlers = {
   config: handleConfig,
 };
 
-const handler = handlers[subcommand];
-if (!handler) {
-  console.error(`Unknown subcommand: ${subcommand}`);
-  console.error(`Available: ${Object.keys(handlers).join(", ")}`);
-  process.exit(1);
+const [subcommand, ...subcommandArgv] = process.argv.slice(2);
+
+async function main() {
+  const handler = handlers[subcommand];
+  if (!handler) {
+    throw usageError(`Unknown subcommand "${subcommand ?? ""}". Available: ${Object.keys(handlers).join(", ")}.`);
+  }
+  return (await handler(subcommandArgv)) ?? EXIT.OK;
 }
 
-handler(argv).catch((err) => {
-  console.error(`Error in ${subcommand}: ${err.message}`);
-  process.exit(1);
+function finish(code) {
+  process.exitCode = code;
+  // An idle keep-alive socket must not hold the process open.
+  setTimeout(() => process.exit(code), 1000).unref();
+}
+
+main().then(finish, (err) => {
+  console.error(`opencode-companion ${subcommand ?? ""}: ${oneLine(err?.message ?? err)}`);
+  finish(err instanceof CompanionError ? err.exitCode : EXIT.FAILED);
 });
+
+// ------------------------------------------------------------------
+// Shared helpers
+// ------------------------------------------------------------------
+
+/**
+ * Parse a subcommand's arguments and resolve its workspace.
+ * @param {string[]} argv
+ * @param {{ valueOptions?: string[], booleanOptions?: string[] }} schema
+ */
+async function commandContext(argv, schema) {
+  const { options, positional } = parseArgs(argv, schema);
+  const workspace = await resolveWorkspace(workspaceOption(options));
+  return { options, positional, workspace };
+}
+
+/**
+ * The model to use: --model, then OPENCODE_PLUGIN_MODEL, then `config --set-model`.
+ * Undefined means OpenCode uses the agent's configured model.
+ * @param {string|boolean|undefined} explicit
+ * @returns {{ model: string|undefined, source: string }}
+ */
+function configuredModel(explicit) {
+  if (typeof explicit === "string" && explicit) return { model: explicit, source: "--model" };
+  if (process.env[MODEL_ENV]) return { model: process.env[MODEL_ENV], source: MODEL_ENV };
+  const saved = loadPluginConfig().model;
+  if (saved) return { model: saved, source: "config" };
+  return { model: undefined, source: "agent default" };
+}
+
+/**
+ * Connect to OpenCode and reject an unknown model before any job is created.
+ * @param {string} workspace
+ * @param {string|undefined} model
+ */
+async function connectChecked(workspace, model) {
+  if (model) parseModel(model);
+  const client = await connect({ cwd: workspace });
+  if (model) await validateModel(client, model);
+  return client;
+}
+
+function findJob(workspace, id) {
+  return loadState(workspace).jobs?.find((j) => j.id === id) ?? null;
+}
+
+/**
+ * Reconcile jobs whose worker may have exited after the server finished.
+ * @param {string} workspace
+ * @param {object[]} jobs
+ */
+async function healJobs(workspace, jobs) {
+  const stuck = healableJobs(jobs);
+  if (stuck.length > 0) await autoHealJobs(workspace, stuck);
+}
+
+/**
+ * Store what the job really used and changed, once OpenCode has answered.
+ * Outside git, OpenCode's own session diff gives the changed file names.
+ */
+async function recordOutcome(workspace, jobId, { client, sessionId, response, before, request }) {
+  let filesChanged = await worktreeChanges(workspace, before);
+  if (!filesChanged && !before) {
+    try {
+      const diff = await client.getSessionDiff(sessionId);
+      filesChanged = { files: (diff ?? []).map((f) => f.file).filter(Boolean), stat: null };
+    } catch {
+      filesChanged = null;
+    }
+  }
+  upsertJob(workspace, {
+    id: jobId,
+    model: formatModel(response?.model) ?? request.model ?? null,
+    agent: response?.agent ?? request.agentName,
+    filesChanged,
+  });
+}
+
+/**
+ * Print the terminal report for a finished job.
+ * @returns {number} 0 when the job completed, 1 when it failed or was cancelled
+ */
+function printJobReport(workspace, jobId) {
+  const job = findJob(workspace, jobId);
+  if (!job) throw new CompanionError(`Job ${jobId} is no longer in ${workspace}.`, EXIT.NOT_FOUND);
+  console.log(renderResult(enrichJob(job, workspace), readJson(jobDataPath(workspace, job.id))));
+  if (job.status === "completed") return EXIT.OK;
+  console.error(`opencode-companion ${subcommand}: job ${job.id} ${job.status}: ${oneLine(job.errorMessage ?? "no details")}`);
+  return EXIT.FAILED;
+}
+
+/**
+ * Find a job by reference in the workspace or, failing that, anywhere.
+ * @returns {{ job: object, workspace: string }}
+ */
+function requireJob(ref, workspace) {
+  const located = locateJob(ref, workspace);
+  if (located.ambiguous) {
+    throw new CompanionError(`Job reference "${ref}" matches more than one job. Use a longer ID.`, EXIT.NOT_FOUND);
+  }
+  if (!located.job) throw new CompanionError(`No job found for "${ref}".`, EXIT.NOT_FOUND);
+  return located;
+}
+
+async function addBreadcrumbs(jobs, workspace) {
+  await Promise.all(jobs.map(async (job) => {
+    if (!job.opencodeSessionId) return;
+    const act = await getSessionLastActivity(job.opencodeSessionId, { cwd: workspace });
+    if (!act) return;
+    const age = act.ageSec != null ? ` (${act.ageSec}s ago)` : "";
+    if (act.kind === "tool") {
+      job.breadcrumb = `running — ${act.tool}${act.command ? `: ${act.command}` : ""}${age}`;
+    } else if (act.kind === "text") {
+      job.breadcrumb = `running — "${act.text}"${age}`;
+    }
+  }));
+}
 
 // ------------------------------------------------------------------
 // Setup
 // ------------------------------------------------------------------
 
 async function handleSetup(argv) {
-  const { options } = parseArgs(argv, {
+  const { options, workspace } = await commandContext(argv, {
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"],
   });
 
-  const installed = await isOpencodeInstalled();
+  const installed = resolveOpencodeBinary() !== null;
   const version = installed ? await getOpencodeVersion() : null;
 
   let serverRunning = false;
@@ -76,7 +218,7 @@ async function handleSetup(argv) {
 
     if (serverRunning) {
       try {
-        const client = await connect({ start: false, cwd: process.cwd() });
+        const client = await connect({ start: false, cwd: workspace });
         const providerList = await client.listProviders();
         providers = providerList.data.map((p) => p.id);
       } catch {
@@ -85,34 +227,18 @@ async function handleSetup(argv) {
     }
   }
 
-  // Handle review gate toggle
-  const workspace = await resolveWorkspace();
-  let reviewGate = false;
-
-  if (options["enable-review-gate"]) {
+  let reviewGate;
+  if (options["enable-review-gate"] || options["disable-review-gate"]) {
+    reviewGate = !!options["enable-review-gate"];
     updateState(workspace, (state) => {
-      state.config = state.config || {};
-      state.config.reviewGate = true;
+      state.config = { ...state.config, reviewGate };
     });
-    reviewGate = true;
-  } else if (options["disable-review-gate"]) {
-    updateState(workspace, (state) => {
-      state.config = state.config || {};
-      state.config.reviewGate = false;
-    });
-    reviewGate = false;
   } else {
-    const state = loadState(workspace);
-    reviewGate = state.config?.reviewGate ?? false;
+    reviewGate = loadState(workspace).config?.reviewGate ?? false;
   }
 
   const status = { installed, version, serverRunning, providers, reviewGate };
-
-  if (options.json) {
-    console.log(JSON.stringify(status, null, 2));
-  } else {
-    console.log(renderSetup(status));
-  }
+  console.log(options.json ? JSON.stringify(status, null, 2) : renderSetup(status));
 }
 
 // ------------------------------------------------------------------
@@ -127,32 +253,31 @@ const REVIEW_SESSION = { readOnly: true, allowShell: true, allowSubagent: true }
 const REVIEW_PROMPT = { agent: "plan", allowShell: true, allowSubagent: true };
 
 async function handleReview(argv) {
-  const { options, positional } = parseArgs(argv, {
-    valueOptions: ["base", "scope"],
+  const { options, positional, workspace } = await commandContext(argv, {
+    valueOptions: ["base", "scope", "model", "prompt-file"],
     booleanOptions: ["wait", "background"],
   });
 
-  const focus = positional.join(" ").trim();
-  if (focus) {
-    console.error("`/opencode:review` uses OpenCode's built-in /review and does not support custom focus text. Use `/opencode:delegate --agent plan` for a review with custom instructions.");
-    process.exit(1);
+  if (readPrompt(options, positional)) {
+    throw usageError("review runs OpenCode's built-in /review, which takes no custom instructions. For a review with your own instructions use /opencode:delegate --agent plan, or task --agent plan --prompt-file <file>.");
   }
-
-  const workspace = await resolveWorkspace();
-  const job = createJobRecord(workspace, "review", { base: options.base });
+  const scope = options.scope ?? "auto";
+  if (!REVIEW_SCOPES.has(scope)) {
+    throw usageError(`Unsupported review scope "${scope}". Use one of: auto, working-tree, branch, or pass --base <ref>.`);
+  }
+  const { model } = configuredModel(options.model);
+  const client = await connectChecked(workspace, model);
+  const request = { agentName: REVIEW_PROMPT.agent, model: model ?? null };
+  const job = createJobRecord(workspace, "review", { base: options.base, agent: request.agentName, model: request.model });
 
   try {
-    const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
+    await runTrackedJob(workspace, job, async ({ report, log }) => {
+      const before = await snapshotWorktree(workspace);
+      upsertJob(workspace, { id: job.id, worktreeBefore: before });
       report("reviewing", "Creating review session...");
       const session = await client.createSession({ title: `Code Review ${job.id}`, ...REVIEW_SESSION });
       upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
 
-      const scope = options.scope ?? "auto";
-      if (!REVIEW_SCOPES.has(scope)) {
-        throw new Error(`Unsupported review scope "${scope}". Use one of: auto, working-tree, branch, or pass --base <ref>.`);
-      }
       let target;
       if (options.base) {
         target = { label: `branch diff against ${options.base}`, commandText: options.base };
@@ -168,230 +293,132 @@ async function handleReview(argv) {
       report("reviewing", "Running OpenCode /review...");
       log(`Built-in /review target: ${target.label}`);
 
-      const response = await client.sendCommand(session.id, "review", target.commandText, REVIEW_PROMPT);
+      const response = await client.sendCommand(session.id, "review", target.commandText, { ...REVIEW_PROMPT, model });
       report("finalizing", "Processing review output...");
-      return { rendered: renderNativeReview(extractResponseText(response), target) };
+      await recordOutcome(workspace, job.id, { client, sessionId: session.id, response, before, request });
+      const text = extractResponseText(response);
+      return { rendered: renderNativeReview(text, target), summary: text.slice(0, 500) };
     });
-
-    console.log(result.rendered);
-  } catch (err) {
-    console.error(`Review failed: ${err.message}`);
-    process.exit(1);
+  } catch {
+    // The failure is stored in the job and shown by the report below.
   }
+  return printJobReport(workspace, job.id);
 }
 
 // ------------------------------------------------------------------
 // Task (delegation)
 // ------------------------------------------------------------------
 
+/**
+ * Run a task job to the end. Shared by foreground tasks and the detached worker.
+ * @param {string} workspace
+ * @param {string} jobId
+ * @param {{ taskText: string, agentName: string, isWrite: boolean, resumeSessionId: string|null, model: string|null }} request
+ */
+async function runTask(workspace, jobId, request) {
+  return runTrackedJob(workspace, { id: jobId }, async ({ report, log }) => {
+    report("starting", "Connecting to OpenCode server...");
+    const client = await connect({ cwd: workspace });
+    const before = await snapshotWorktree(workspace);
+    upsertJob(workspace, { id: jobId, worktreeBefore: before });
+
+    let sessionId = request.resumeSessionId;
+    if (sessionId) {
+      report("starting", `Resuming OpenCode session ${sessionId}`);
+    } else {
+      const session = await client.createSession({ title: `Task ${jobId}`, readOnly: !request.isWrite });
+      sessionId = session.id;
+      report("starting", `Created OpenCode session ${sessionId}`);
+    }
+    upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
+
+    report("investigating", "Sending task to OpenCode...");
+    log(`Agent: ${request.agentName}, Model: ${request.model ?? "agent default"}, Write: ${request.isWrite}, Prompt: ${request.taskText.length} chars`);
+    const response = await client.sendPrompt(sessionId, request.taskText, {
+      agent: request.agentName,
+      model: request.model ?? undefined,
+      readOnly: !request.isWrite,
+    });
+
+    report("finalizing", "Collecting results...");
+    await recordOutcome(workspace, jobId, { client, sessionId, response, before, request });
+    const text = extractResponseText(response);
+    return { rendered: text, summary: text.slice(0, 500) };
+  });
+}
+
 async function handleTask(argv) {
-  const { options, positional } = parseArgs(argv, {
-    valueOptions: ["model", "agent"],
+  const { options, positional, workspace } = await commandContext(argv, {
+    valueOptions: ["model", "agent", "prompt-file"],
     booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
   });
 
-  const taskText = extractTaskText(argv, ["model", "agent"], [
-    "write", "background", "wait", "resume-last", "fresh",
-  ]);
-
+  const taskText = readPrompt(options, positional);
   if (!taskText) {
-    console.error("No task text provided.");
-    process.exit(1);
+    throw usageError("No task text. Pass the prompt as text, with --prompt-file <path>, or with --prompt-file - to read stdin.");
+  }
+  if (options["resume-last"] && options.fresh) {
+    throw usageError("Use either --resume-last or --fresh, not both.");
   }
 
-  const workspace = await resolveWorkspace();
-  const isWrite = options.agent === "plan" ? false : options.write !== undefined ? options.write : true;
-  const agentName = options.agent ?? (isWrite ? "build" : "plan");
+  const isWrite = options.agent !== "plan";
+  const agentName = options.agent ?? "build";
+  const { model } = configuredModel(options.model);
+  await connectChecked(workspace, model);
 
-  // Check for resume
-  let resumeSessionId = null;
-  if (options["resume-last"]) {
-    const state = loadState(workspace);
-    const sessionId = getClaudeSessionId();
-    const lastTask = state.jobs
-      ?.filter((j) => j.type === "task" && j.opencodeSessionId)
-      ?.filter((j) => !sessionId || j.sessionId === sessionId)
-      ?.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))?.[0];
+  const resumeSessionId = options["resume-last"]
+    ? latestTaskSession(loadState(workspace).jobs, getClaudeSessionId())?.opencodeSessionId ?? null
+    : null;
+  const request = { taskText, agentName, isWrite, resumeSessionId, model: model ?? null };
+  const job = createJobRecord(workspace, "task", { agent: agentName, model: request.model, resumeSessionId, request });
 
-    if (lastTask?.opencodeSessionId) {
-      resumeSessionId = lastTask.opencodeSessionId;
-    }
-  }
-
-  const job = createJobRecord(workspace, "task", {
-    agent: agentName,
-    resumeSessionId,
-  });
-
-  // Background mode: spawn a detached worker
   if (options.background) {
     const logFile = jobLogPath(workspace, job.id);
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
-    upsertJob(workspace, {
-      id: job.id,
-      status: "queued",
-      phase: "queued",
+    // The worker reads the prompt from the job record, so the prompt never
+    // passes through a command line.
+    const child = spawnDetached(process.execPath, [COMPANION_SCRIPT, "task-worker", "--job-id", job.id, "--cwd", workspace], {
+      cwd: workspace,
       logFile,
-      request: {
-        taskText,
-        agentName,
-        isWrite,
-        resumeSessionId,
-        model: options.model,
-      },
     });
-
-    const workerArgs = [
-      path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs"),
-      "task-worker",
-      "--job-id", job.id,
-      "--workspace", workspace,
-      "--task-text", taskText,
-      "--agent", agentName,
-    ];
-    if (isWrite) workerArgs.push("--write");
-    if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
-    if (options.model) workerArgs.push("--model", options.model);
-
-    const child = spawnDetached("node", workerArgs, { cwd: workspace, logFile });
-    upsertJob(workspace, { id: job.id, pid: child.pid });
+    // Recorded before the worker's first write, so cancel can stop a queued worker.
+    upsertJob(workspace, { id: job.id, status: "queued", phase: "queued", logFile, pid: child.pid });
+    child.once("error", (err) => {
+      upsertJob(workspace, { id: job.id, status: "failed", completedAt: new Date().toISOString(), errorMessage: `Worker did not start: ${err.message}` });
+    });
     console.log(`OpenCode task started in background: ${job.id}`);
-    console.log("Check `/opencode:status` for progress.");
-    return;
+    console.log(`Workspace: ${workspace}`);
+    return EXIT.OK;
   }
 
-  // Foreground mode
   try {
-    const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
-
-      let sessionId;
-      if (resumeSessionId) {
-        report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
-        sessionId = resumeSessionId;
-      } else {
-        report("starting", "Creating new OpenCode session...");
-        const session = await client.createSession({ title: `Task ${job.id}`, readOnly: !isWrite });
-        sessionId = session.id;
-      }
-      upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
-
-      report("investigating", "Sending task to OpenCode...");
-      log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${taskText.length} chars`);
-
-      const response = await client.sendPrompt(sessionId, taskText, {
-        agent: agentName,
-        model: options.model,
-        readOnly: !isWrite,
-      });
-
-      report("finalizing", "Processing task output...");
-
-      const text = extractResponseText(response);
-
-      // Get changed files if write mode
-      let changedFiles = [];
-      if (isWrite) {
-        try {
-          const diff = await client.getSessionDiff(sessionId);
-          changedFiles = diff.map((f) => f.file).filter(Boolean);
-        } catch {
-          // diff endpoint may not be available
-        }
-      }
-
-      return {
-        rendered: text,
-        messages: response,
-        changedFiles,
-        summary: text.slice(0, 500),
-      };
-    });
-
-    console.log(result.rendered);
-  } catch (err) {
-    console.error(`Task failed: ${err.message}`);
-    process.exit(1);
+    await runTask(workspace, job.id, request);
+  } catch {
+    // The failure is stored in the job and shown by the report below.
   }
+  return printJobReport(workspace, job.id);
 }
 
 async function handleTaskWorker(argv) {
-  const { options } = parseArgs(argv, {
-    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session"],
-    booleanOptions: ["write"],
-  });
-
-  const workspace = options.workspace;
+  const { options, workspace } = await commandContext(argv, { valueOptions: ["job-id"] });
   const jobId = options["job-id"];
-  const taskText = options["task-text"];
-  const agentName = options.agent ?? "build";
-  const isWrite = !!options.write;
-  const resumeSessionId = options["resume-session"];
-
-  if (!workspace || !jobId || !taskText) {
-    process.exit(1);
-  }
-
+  if (!jobId || !workspaceOption(options)) throw usageError("task-worker needs --job-id and --cwd.");
+  const request = findJob(workspace, jobId)?.request;
+  if (!request?.taskText) throw new CompanionError(`No queued task ${jobId} in ${workspace}.`, EXIT.NOT_FOUND);
   try {
-    await runTrackedJob(workspace, { id: jobId }, async ({ report, log }) => {
-      report("starting", "Background worker connecting to OpenCode...");
-      const client = await connect({ cwd: workspace });
-
-      let sessionId;
-      if (resumeSessionId) {
-        sessionId = resumeSessionId;
-        report("starting", `Resuming session ${resumeSessionId}...`);
-      } else {
-        const session = await client.createSession({ title: `Task ${jobId}`, readOnly: !isWrite });
-        sessionId = session.id;
-        report("starting", `Created session ${sessionId}`);
-      }
-      upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
-
-      report("investigating", "Running task...");
-
-      const response = await client.sendPrompt(sessionId, taskText, {
-        agent: agentName,
-        model: options.model,
-        readOnly: !isWrite,
-      });
-
-      const text = extractResponseText(response);
-      report("finalizing", "Done");
-
-      return { rendered: text, summary: text.slice(0, 500) };
-    });
-  } catch (err) {
-    // Error is already logged by runTrackedJob
-    process.exit(1);
+    await runTask(workspace, jobId, request);
+  } catch {
+    return EXIT.FAILED;
   }
+  return EXIT.OK;
 }
 
 async function handleTaskResumeCandidate(argv) {
-  const { options } = parseArgs(argv, { booleanOptions: ["json"] });
+  const { options, workspace } = await commandContext(argv, { booleanOptions: ["json"] });
+  await healJobs(workspace, loadState(workspace).jobs);
 
-  const workspace = await resolveWorkspace();
-  let state = loadState(workspace);
-  const sessionId = getClaudeSessionId();
-
-  // Heal first so "latest completed" reflects session reality, not a stale
-  // "running" flag from a dead worker.
-  const healable = (state.jobs ?? []).filter(
-    (j) => j.type === "task" && j.opencodeSessionId &&
-      ["starting", "investigating", "running", "finalizing"].includes(j.status),
-  );
-  if (healable.length > 0) {
-    await autoHealJobs(workspace, healable);
-    state = loadState(workspace);
-  }
-
-  const lastTask = state.jobs
-    ?.filter((j) => j.type === "task" && j.opencodeSessionId)
-    ?.filter((j) => j.status === "completed" || j.status === "running")
-    ?.filter((j) => !sessionId || j.sessionId === sessionId)
-    ?.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))?.[0];
-
+  const lastTask = latestTaskSession(loadState(workspace).jobs, getClaudeSessionId(),
+    (j) => j.status === "completed" || isActiveJob(j));
   const result = {
     available: !!lastTask,
     jobId: lastTask?.id ?? null,
@@ -410,230 +437,144 @@ async function handleTaskResumeCandidate(argv) {
 // ------------------------------------------------------------------
 
 async function handleStatus(argv) {
-  const { options, positional } = parseArgs(argv ?? [], {
+  const { options, positional, workspace: cwdWorkspace } = await commandContext(argv, {
     booleanOptions: ["json", "all"],
   });
-
-  const workspace = await resolveWorkspace();
-  let state = loadState(workspace);
-  const sessionId = getClaudeSessionId();
-  // Auto-heal stuck jobs before building the snapshot so `status` never lies
-  // about completion. Safe on ECONNREFUSED (probe returns reachable:false).
-  const healable = (state.jobs ?? []).filter(
-    (j) => j.opencodeSessionId &&
-      ["starting", "investigating", "running", "finalizing"].includes(j.status),
-  );
-  if (healable.length > 0) {
-    await autoHealJobs(workspace, healable);
-    state = loadState(workspace);
-  }
-  const jobs = state.jobs ?? [];
   const wantJson = !!options.json;
-  // --all widens the snapshot filter to every session's jobs; without --all we
-  // still filter to the current Claude session for the existing markdown UX.
-  const sessionFilter = options.all ? undefined : sessionId;
-  const ref = positional?.[0];
+  const ref = positional[0];
 
-  // Single-task query — `status <tid> [--json]`.
   if (ref) {
-    const { job, ambiguous } = matchJobReference(jobs, ref);
-    if (ambiguous) {
+    const located = locateJob(ref, cwdWorkspace);
+    if (!located.job) {
+      const error = located.ambiguous ? "ambiguous" : "not_found";
       if (wantJson) {
-        console.log(JSON.stringify({ workspaceRoot: workspace, job: null, error: "ambiguous" }));
+        console.log(JSON.stringify({ schemaVersion: STATUS_SCHEMA_VERSION, workspaceRoot: cwdWorkspace, job: null, error }));
       } else {
-        console.error(`Ambiguous job reference "${ref}". Please provide a more specific ID prefix.`);
+        console.error(`opencode-companion status: ${located.ambiguous ? `"${ref}" matches more than one job` : `no job found for "${ref}"`}.`);
       }
-      process.exit(ambiguous ? 2 : 0);
-      return;
+      return EXIT.NOT_FOUND;
     }
+    const { workspace } = located;
+    await healJobs(workspace, [located.job]);
+    const job = toJobView(enrichJob(findJob(workspace, located.job.id) ?? located.job, workspace), workspace);
+    if (isActiveJob(job)) await addBreadcrumbs([job], workspace);
     if (wantJson) {
-      const enriched = job ? enrichJob(job, workspace) : null;
-      console.log(JSON.stringify({ workspaceRoot: workspace, job: enriched }));
-      return;
+      console.log(JSON.stringify({ schemaVersion: STATUS_SCHEMA_VERSION, workspaceRoot: workspace, job }));
+    } else {
+      const active = isActiveJob(job);
+      console.log(renderStatus({ running: active ? [job] : [], latestFinished: active ? null : job, recent: [] }));
     }
-    if (!job) {
-      console.log(`No job found for "${ref}" in workspace ${workspace}.`);
-      return;
-    }
-    console.log(renderStatus({ running: [], latestFinished: null, recent: [enrichJob(job, workspace)] }));
-    return;
+    return EXIT.OK;
   }
 
-  const snapshot = buildStatusSnapshot(jobs, workspace, { sessionId: sessionFilter });
-
-  // Enrich running jobs with a live breadcrumb from the opencode session —
-  // gives newcomers a human-legible "running — bash: docker exec ..." line
-  // instead of a stale "investigating" phase from state.json. Runs in parallel
-  // and gracefully falls back if the server is unreachable.
-  if (snapshot.running.length > 0) {
-    await Promise.all(snapshot.running.map(async (job) => {
-      if (!job.opencodeSessionId) return;
-      const act = await getSessionLastActivity(job.opencodeSessionId, { cwd: workspace });
-      if (!act) return;
-      const age = act.ageSec != null ? `${act.ageSec}s ago` : "";
-      if (act.kind === "tool") {
-        const head = act.command ? `: ${act.command}` : "";
-        job.breadcrumb = `running — ${act.tool}${head}${age ? ` (${age})` : ""}`.trim();
-      } else if (act.kind === "text") {
-        job.breadcrumb = `running — "${act.text}"${age ? ` (${age})` : ""}`;
-      }
-    }));
-  }
+  const workspace = cwdWorkspace;
+  await healJobs(workspace, loadState(workspace).jobs);
+  // --all shows every Claude session's jobs; otherwise only this session's.
+  const sessionFilter = options.all ? undefined : getClaudeSessionId();
+  const snapshot = buildStatusSnapshot(loadState(workspace).jobs ?? [], workspace, { sessionId: sessionFilter });
+  await addBreadcrumbs(snapshot.running, workspace);
 
   if (wantJson) {
-    // Machine-readable shape mirrors the single-task case so callers can treat
-    // both uniformly: a `.job` field is present for single-task, otherwise
-    // `.running`/`.recent` arrays describe the whole workspace snapshot.
+    const view = (job) => toJobView(job, workspace);
     console.log(JSON.stringify({
+      schemaVersion: STATUS_SCHEMA_VERSION,
       workspaceRoot: workspace,
-      running: snapshot.running,
-      latestFinished: snapshot.latestFinished,
-      recent: snapshot.recent,
+      running: snapshot.running.map(view),
+      latestFinished: snapshot.latestFinished ? view(snapshot.latestFinished) : null,
+      recent: snapshot.recent.map(view),
     }));
-    return;
+    return EXIT.OK;
   }
 
   console.log(renderStatus(snapshot));
+  return EXIT.OK;
 }
 
 async function handleResult(argv) {
-  const { positional } = parseArgs(argv, {});
+  const { positional, workspace: cwdWorkspace } = await commandContext(argv, {});
   const ref = positional[0];
 
-  const workspace = await resolveWorkspace();
-  let state = loadState(workspace);
-  // Auto-heal before resolving so that if the caller asks for the latest
-  // result, we don't return "no finished job" while a silently-completed
-  // session is waiting to be reconciled.
-  const healable = (state.jobs ?? []).filter(
-    (j) => j.opencodeSessionId &&
-      ["starting", "investigating", "running", "finalizing"].includes(j.status),
-  );
-  if (healable.length > 0) {
-    await autoHealJobs(workspace, healable);
-    state = loadState(workspace);
+  if (!ref) {
+    await healJobs(cwdWorkspace, loadState(cwdWorkspace).jobs);
+    const { job } = resolveResultJob(loadState(cwdWorkspace).jobs ?? []);
+    if (!job) throw new CompanionError(`No finished job in ${cwdWorkspace}.`, EXIT.NOT_FOUND);
+    return printJobReport(cwdWorkspace, job.id);
   }
 
-  const { job, ambiguous } = resolveResultJob(state.jobs ?? [], ref);
-
-  if (ambiguous) {
-    console.error("Ambiguous job reference. Please provide a more specific ID prefix.");
-    process.exit(1);
+  const { job, workspace } = requireJob(ref, cwdWorkspace);
+  await healJobs(workspace, [job]);
+  const current = findJob(workspace, job.id);
+  if (isActiveJob(current)) {
+    throw new CompanionError(`Job ${job.id} is still ${current.status}. Use wait-and-result ${job.id}.`, EXIT.RUNNING);
   }
-
-  if (!job) {
-    console.log("No finished job found.");
-    return;
-  }
-
-  const enriched = enrichJob(job, workspace);
-
-  // Try to load detailed result data
-  const dataFile = jobDataPath(workspace, job.id);
-  const resultData = readJson(dataFile);
-
-  console.log(renderResult(enriched, resultData));
+  return printJobReport(workspace, job.id);
 }
 
 async function handleWaitAndResult(argv) {
-  const { options, positional } = parseArgs(argv, {
+  const { options, positional, workspace: cwdWorkspace } = await commandContext(argv, {
     valueOptions: ["max-wait"],
     booleanOptions: ["json"],
   });
 
   const ref = positional[0];
-  if (!ref) {
-    console.error("No task ID provided.");
-    process.exit(1);
+  if (!ref) throw usageError("wait-and-result needs a job ID.");
+
+  const maxWait = Number(options["max-wait"] ?? "480");
+  if (!Number.isInteger(maxWait) || maxWait < 1 || maxWait > 600) {
+    throw usageError("--max-wait must be a whole number of seconds between 1 and 600.");
   }
 
-  const maxWait = parseInt(options["max-wait"] ?? "480", 10);
-  if (isNaN(maxWait) || maxWait < 1 || maxWait > 600) {
-    console.error("--max-wait must be between 1 and 600 seconds.");
-    process.exit(1);
-  }
-
-  const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
-  const jobs = state.jobs ?? [];
-
-  const { job, ambiguous } = matchJobReference(jobs, ref);
-  if (ambiguous) {
-    console.error(`Ambiguous job reference "${ref}". Please provide a more specific ID.`);
-    process.exit(1);
-  }
-  if (!job) {
-    console.error(`No job found for "${ref}".`);
-    process.exit(1);
-  }
-
+  const { job, workspace } = requireJob(ref, cwdWorkspace);
   const startTime = Date.now();
-  const pollInterval = 250;
-  const maxWaitMs = maxWait * 1000;
-  const logFile = jobLogPath(workspace, job.id);
+  const deadline = startTime + maxWait * 1000;
+  let nextHeal = 0;
 
-  const terminalStatuses = ["completed", "failed", "cancelled"];
-
-  const isTerminal = (j) => terminalStatuses.includes(j?.status);
-
-  if (isTerminal(job)) {
-    const enriched = enrichJob(job, workspace);
-    const dataFile = jobDataPath(workspace, job.id);
-    const resultData = readJson(dataFile);
-    console.log(renderResult(enriched, resultData));
-    process.exit(0);
-  }
-
-  while (Date.now() - startTime < maxWaitMs) {
-    await new Promise((r) => setTimeout(r, pollInterval));
-
-    const currentState = loadState(workspace);
-    const { job: currentJob } = matchJobReference(currentState.jobs ?? [], ref);
-    if (isTerminal(currentJob)) {
-      const enriched = enrichJob(currentJob, workspace);
-      const dataFile = jobDataPath(workspace, currentJob.id);
-      const resultData = readJson(dataFile);
-      console.log(renderResult(enriched, resultData));
-      process.exit(0);
+  while (true) {
+    let current = findJob(workspace, job.id);
+    // A worker that died before saving its result leaves the job running;
+    // ask the server whether the session finished.
+    if (isActiveJob(current) && Date.now() >= nextHeal && !isProcessAlive(current.pid)) {
+      await healJobs(workspace, [current]);
+      current = findJob(workspace, job.id);
+      nextHeal = Date.now() + 30_000;
     }
+    if (!isActiveJob(current)) return printJobReport(workspace, job.id);
+    if (Date.now() >= deadline) break;
+    await delay(250);
   }
 
-  const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
-  const timeoutOutput = {
+  console.log(JSON.stringify({
     status: "running",
-    elapsed: elapsedSec,
+    elapsed: Math.floor((Date.now() - startTime) / 1000),
     task_id: job.id,
-    log_file: logFile,
-  };
-
-  if (options.json) {
-    console.log(JSON.stringify(timeoutOutput));
-  } else {
-    console.log(JSON.stringify(timeoutOutput));
-  }
-  process.exit(2);
+    workspace,
+    log_file: jobLogPath(workspace, job.id),
+  }));
+  return EXIT.RUNNING;
 }
 
 async function handleCancel(argv) {
-  const { positional } = parseArgs(argv, {});
+  const { positional, workspace: cwdWorkspace } = await commandContext(argv, {});
   const ref = positional[0];
 
-  const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
-
-  const { job, ambiguous } = resolveCancelableJob(state.jobs ?? [], ref);
-
-  if (ambiguous) {
-    console.error("Multiple running jobs. Please specify a job ID prefix.");
-    process.exit(1);
+  let job;
+  let workspace = cwdWorkspace;
+  if (ref) {
+    ({ job, workspace } = requireJob(ref, cwdWorkspace));
+    if (!isActiveJob(job)) {
+      console.log(`Job ${job.id} is already ${job.status}; nothing to cancel.`);
+      return EXIT.OK;
+    }
+  } else {
+    const resolved = resolveCancelableJob(loadState(workspace).jobs ?? []);
+    if (resolved.ambiguous) throw usageError("More than one job is running. Pass the job ID to cancel.");
+    job = resolved.job;
+    if (!job) {
+      console.log("No active job to cancel.");
+      return EXIT.OK;
+    }
   }
 
-  if (!job) {
-    console.log("No active job to cancel.");
-    return;
-  }
-
-  // Abort the OpenCode session if we have one
   if (job.opencodeSessionId) {
     try {
       const client = await connect({ start: false, cwd: workspace });
@@ -643,8 +584,7 @@ async function handleCancel(argv) {
     }
   }
 
-  // Kill the process if we have a PID
-  if (job.pid) {
+  if (job.pid && job.pid !== process.pid && isProcessAlive(job.pid)) {
     try {
       process.kill(job.pid, "SIGTERM");
     } catch {
@@ -654,12 +594,14 @@ async function handleCancel(argv) {
 
   upsertJob(workspace, {
     id: job.id,
-    status: "failed",
+    status: "cancelled",
+    phase: "cancelled",
     completedAt: new Date().toISOString(),
-    errorMessage: "Canceled by user",
+    errorMessage: "Cancelled by user",
   });
 
-  console.log(`Canceled job: ${job.id}`);
+  console.log(`Cancelled job: ${job.id}`);
+  return EXIT.OK;
 }
 
 // ------------------------------------------------------------------
@@ -667,34 +609,21 @@ async function handleCancel(argv) {
 // ------------------------------------------------------------------
 
 async function handleHeal(argv) {
-  const { options } = parseArgs(argv ?? [], {
+  const { options, workspace } = await commandContext(argv, {
     booleanOptions: ["json", "dry-run", "all"],
   });
-
-  const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
   const sessionId = getClaudeSessionId();
   const dryRun = !!options["dry-run"];
 
-  let jobs = state.jobs ?? [];
+  let jobs = loadState(workspace).jobs ?? [];
   if (!options.all && sessionId) {
     jobs = jobs.filter((j) => !j.sessionId || j.sessionId === sessionId);
   }
-
-  const healable = jobs.filter(
-    (j) => j.opencodeSessionId &&
-      ["starting", "investigating", "running", "finalizing"].includes(j.status),
-  );
-
+  const healable = healableJobs(jobs);
   const { actions } = await autoHealJobs(workspace, healable, { dryRun });
 
   if (options.json) {
-    console.log(JSON.stringify({
-      workspaceRoot: workspace,
-      dryRun,
-      scanned: healable.length,
-      actions,
-    }, null, 2));
+    console.log(JSON.stringify({ workspaceRoot: workspace, dryRun, scanned: healable.length, actions }, null, 2));
     return;
   }
 
@@ -713,62 +642,44 @@ async function handleHeal(argv) {
 }
 
 // ------------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------------
-
-/**
- * Extract text from an OpenCode API response.
- * @param {any} response
- * @returns {string}
- */
-// ------------------------------------------------------------------
 // Doctor (onboarding self-test + optional auto-repair)
 // ------------------------------------------------------------------
 
 async function handleDoctor(argv) {
-  const { options } = parseArgs(argv ?? [], {
+  const { options, workspace } = await commandContext(argv, {
     booleanOptions: ["json", "fix", "verbose"],
   });
   const fix = !!options.fix;
-  const wantJson = !!options.json;
   const verbose = !!options.verbose;
-  const IS_WINDOWS = process.platform === "win32";
 
   const checks = [];
   const push = (name, status, detail, hint) => checks.push({ name, status, detail, hint });
 
-  // 1. opencode binary in PATH
-  const which = await runCommand("which", ["opencode"]).catch(() => ({ exitCode: 1, stdout: "" }));
-  if (which.exitCode === 0 && which.stdout.trim()) {
-    push("opencode-binary", "PASS", which.stdout.trim(), null);
+  const bin = resolveOpencodeBinary();
+  if (bin) {
+    push("opencode-binary", "PASS", bin, null);
   } else {
-    push("opencode-binary", "FAIL", "not in PATH",
-      "Install OpenCode V2: https://opencode.ai/v2/docs/cli/");
+    push("opencode-binary", "FAIL", "not in PATH", "Install OpenCode V2: https://opencode.ai/v2/docs/cli/");
   }
 
-  // 2. opencode version
-  const ver = await runCommand("opencode", ["--version"]).catch(() => ({ exitCode: 1, stdout: "" }));
-  if (ver.exitCode === 0 && /(?:^|\s)v?2\./.test(ver.stdout)) {
-    push("opencode-version", "PASS", ver.stdout.trim() || "(unknown)", null);
+  const version = bin ? await getOpencodeVersion() : null;
+  if (version && /(?:^|\s)v?2\./.test(version)) {
+    push("opencode-version", "PASS", version, null);
   } else {
-    push("opencode-version", "FAIL", ver.stdout.trim() || "could not resolve version", "OpenCode V2 is required.");
+    push("opencode-version", "FAIL", version || "could not resolve version", "OpenCode V2 is required.");
   }
 
   // V2 honors the user's configuration. Never rewrite global permissions.
   push("opencode-permissions", "PASS", "session-scoped headless policy; global config unchanged", null);
 
-  // 4. server reachable
   const endpoint = await discoverServer().catch(() => undefined);
   const serverUrl = endpoint?.url || "(not discovered)";
-  const reachable = await isServerRunning();
-  if (reachable) {
+  if (await isServerRunning()) {
     push("opencode-server", "PASS", `${serverUrl} reachable`, null);
   } else {
-    push("opencode-server", "WARN", `${serverUrl} not reachable`,
-      "Start OpenCode or run: opencode service start");
+    push("opencode-server", "WARN", `${serverUrl} not reachable`, "Start OpenCode or run: opencode service start");
   }
 
-  // 5. CLAUDE_PLUGIN_DATA sanity check
   const envData = process.env.CLAUDE_PLUGIN_DATA;
   if (envData && !/opencode/i.test(path.basename(envData))) {
     push("plugin-data-env", "WARN",
@@ -778,19 +689,12 @@ async function handleDoctor(argv) {
     push("plugin-data-env", "PASS", envData ? envData : "(unset — self-derived)", null);
   }
 
-  // 6. resolved state dir
-  const workspace = await resolveWorkspace();
   const sRoot = stateRoot(workspace);
   push("state-dir", "PASS", sRoot, null);
 
-  // 7. stuck jobs for this workspace
-  const state = loadState(workspace);
   const sessionId = getClaudeSessionId();
-  const jobs = (state.jobs ?? []).filter((j) => !sessionId || j.sessionId === sessionId);
-  const healable = jobs.filter(
-    (j) => j.opencodeSessionId &&
-      ["starting", "investigating", "running", "finalizing"].includes(j.status),
-  );
+  const jobs = (loadState(workspace).jobs ?? []).filter((j) => !sessionId || j.sessionId === sessionId);
+  const healable = healableJobs(jobs);
   if (healable.length === 0) {
     push("stuck-jobs", "PASS", "none", null);
   } else if (fix) {
@@ -801,14 +705,13 @@ async function handleDoctor(argv) {
       "Run: companion heal  (or companion doctor --fix)");
   }
 
-  // 8. disk free on state-dir parent
-  if (IS_WINDOWS) {
+  if (process.platform === "win32") {
     push("disk-free", "PASS", "N/A (Windows)", null);
   } else {
     // Walk up to the first existing ancestor — stateRoot may not exist yet.
     let probe = sRoot;
     while (probe && probe !== "/" && !fs.existsSync(probe)) probe = path.dirname(probe);
-    const df = await runCommand("df", ["-h", probe]).catch(() => ({ exitCode: 1, stdout: "" }));
+    const df = await runCommand("df", ["-h", probe]);
     const lines = (df.stdout || "").split("\n").filter(Boolean);
     const last = lines[lines.length - 1] || "";
     if (last && last !== lines[0]) {
@@ -818,64 +721,76 @@ async function handleDoctor(argv) {
     }
   }
 
-  // Summary
   const nFail = checks.filter((c) => c.status === "FAIL").length;
   const nWarn = checks.filter((c) => c.status === "WARN").length;
   const summary = nFail + nWarn === 0
     ? "All good"
     : `${nWarn} warnings, ${nFail} failures${!fix ? " — run with --fix to repair" : ""}`;
 
-  if (nFail > 0) process.exitCode = 1;
-
-  if (wantJson) {
+  if (options.json) {
     console.log(JSON.stringify({
       summary: { failures: nFail, warnings: nWarn, fix },
       checks,
       workspace,
       stateRoot: sRoot,
     }, null, 2));
-    return;
+  } else {
+    for (const c of checks) {
+      console.log(`[${c.status}] ${c.name} — ${c.detail}`);
+      if (c.hint && (verbose || c.status !== "PASS")) console.log(`       ${c.hint}`);
+    }
+    console.log(`\n${nFail + nWarn === 0 ? "OK" : "!! "} ${summary}`);
   }
-
-  // Compact text output — ~1 line per check
-  for (const c of checks) {
-    const tag = c.status === "PASS" ? "PASS" : c.status === "WARN" ? "WARN" : "FAIL";
-    console.log(`[${tag}] ${c.name} — ${c.detail}`);
-    if (verbose && c.hint) console.log(`       ${c.hint}`);
-    else if (c.status !== "PASS" && c.hint) console.log(`       ${c.hint}`);
-  }
-  console.log(`\n${nFail + nWarn === 0 ? "OK" : "!! "} ${summary}`);
+  return nFail > 0 ? EXIT.FAILED : EXIT.OK;
 }
 
 // ------------------------------------------------------------------
-// Config (resolved settings dump — easier onboarding than reading source)
+// Config (resolved settings, and the default model)
 // ------------------------------------------------------------------
 
 async function handleConfig(argv) {
-  const { options } = parseArgs(argv ?? [], { booleanOptions: ["json"] });
-  const wantJson = !!options.json;
+  const { options, workspace } = await commandContext(argv, {
+    valueOptions: ["set-model"],
+    booleanOptions: ["json", "unset-model"],
+  });
+
+  if (options["set-model"] !== undefined && options["unset-model"]) {
+    throw usageError("Use either --set-model or --unset-model, not both.");
+  }
+  if (options["set-model"] !== undefined) {
+    const model = String(options["set-model"]);
+    parseModel(model);
+    if (await isServerRunning()) await validateModel(await connect({ start: false, cwd: workspace }), model);
+    updatePluginConfig((config) => {
+      config.model = model;
+    });
+  } else if (options["unset-model"]) {
+    updatePluginConfig((config) => {
+      delete config.model;
+    });
+  }
 
   const envSpec = [
+    [MODEL_ENV, "(unset)", "Default model for task and review (provider/model[#variant])"],
     ["OPENCODE_REQUEST_TIMEOUT_MS", "1800000", "Per-HTTP-request abort timeout"],
-    ["OPENCODE_PROMPT_TIMEOUT_MS",  "14400000", "Session completion timeout"],
+    ["OPENCODE_PROMPT_TIMEOUT_MS", "14400000", "Session completion timeout"],
     ["OPENCODE_COMPLETION_POLL_MS", "5000", "Watcher poll interval during sendPrompt"],
-    ["OPENCODE_COMPANION_DATA",     "(self-derived)", "Override for plugin data dir"],
-    ["OPENCODE_SERVER_URL",        "(discovered)", "Explicit V2 server URL (otherwise use the local service)"],
-    ["OPENCODE_SERVER_PASSWORD",    "(unset)", "HTTP Basic auth password"],
-    ["OPENCODE_SERVER_USERNAME",    "opencode", "HTTP Basic auth username"],
+    ["OPENCODE_COMPANION_DATA", "(self-derived)", "Override for plugin data dir"],
+    ["OPENCODE_SERVER_URL", "(discovered)", "Explicit V2 server URL (otherwise use the local service)"],
+    ["OPENCODE_SERVER_PASSWORD", "(unset)", "HTTP Basic auth password"],
+    ["OPENCODE_SERVER_USERNAME", "opencode", "HTTP Basic auth username"],
   ];
-  const envRows = envSpec.map(([name, dflt, desc]) => {
+  const envRows = envSpec.map(([name, dflt, description]) => {
     const v = process.env[name];
     return {
       name,
-      value: name === "OPENCODE_SERVER_PASSWORD" && v ? "(redacted)" : v != null ? v : dflt,
-      source: v != null ? "env" : (dflt.startsWith("(") ? "default" : "default"),
-      description: desc,
+      value: name === "OPENCODE_SERVER_PASSWORD" && v ? "(redacted)" : v ?? dflt,
+      source: v != null ? "env" : "default",
+      description,
     };
   });
 
-  const workspace = await resolveWorkspace();
-  const sRoot = stateRoot(workspace);
+  const defaultModel = configuredModel(undefined);
   const endpoint = await discoverServer().catch(() => undefined);
   const serverUrl = endpoint?.url || "(not discovered)";
   const serverReachable = await isServerRunning();
@@ -883,24 +798,25 @@ async function handleConfig(argv) {
   const out = {
     env: envRows,
     workspace,
-    stateRoot: sRoot,
+    stateRoot: stateRoot(workspace),
+    defaultModel: { value: defaultModel.model ?? null, source: defaultModel.source },
     permissions: "session-scoped; global config unchanged",
     server: { url: serverUrl, reachable: serverReachable },
   };
 
-  if (wantJson) {
+  if (options.json) {
     console.log(JSON.stringify(out, null, 2));
     return;
   }
 
   console.log("## OpenCode Companion Config\n");
   console.log(`- Workspace: ${workspace}`);
-  console.log(`- State dir: ${sRoot}`);
+  console.log(`- State dir: ${out.stateRoot}`);
+  console.log(`- Default model: ${out.defaultModel.value ?? "(agent default)"} [${out.defaultModel.source}]`);
   console.log(`- Permissions: ${out.permissions}`);
   console.log(`- Server: ${serverUrl} (${serverReachable ? "reachable" : "unreachable"})`);
   console.log("\n### Environment variables\n");
   for (const r of envRows) {
-    const src = r.source === "env" ? "env" : "default";
-    console.log(`- ${r.name} = ${r.value} [${src}] — ${r.description}`);
+    console.log(`- ${r.name} = ${r.value} [${r.source}] — ${r.description}`);
   }
 }
