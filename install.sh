@@ -57,7 +57,7 @@ fi
 PLUGIN_JSON="$MKT_DIR/plugins/$PLUGIN_NAME/.claude-plugin/plugin.json"
 [ -f "$PLUGIN_JSON" ] || error "plugin.json not found at $PLUGIN_JSON"
 
-VERSION=$(python3 -c "import json; print(json.load(open('$PLUGIN_JSON'))['version'])" 2>/dev/null || echo "1.0.0")
+VERSION=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version)' "$PLUGIN_JSON" 2>/dev/null || echo "1.0.0")
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
 
 info "Plugin version: $VERSION"
@@ -72,19 +72,15 @@ if [ ! -f "$KNOWN_MKT" ]; then
   echo '{}' > "$KNOWN_MKT"
 fi
 
-python3 -c "
-import json, sys
-with open('$KNOWN_MKT', 'r') as f:
-    data = json.load(f)
-data['$MARKETPLACE_NAME'] = {
-    'source': {'source': 'github', 'repo': '$REPO'},
-    'installLocation': '$MKT_DIR',
-    'lastUpdated': '$NOW'
-}
-with open('$KNOWN_MKT', 'w') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-" || warn "Could not update known_marketplaces.json (non-fatal)"
+# Paths go in as arguments, never into the script text.
+node -e '
+const fs = require("fs");
+const path = require("path");
+const [file, name, repo, location, now] = process.argv.slice(1);
+const data = JSON.parse(fs.readFileSync(file, "utf8"));
+data[name] = { source: { source: "github", repo }, installLocation: path.resolve(location), lastUpdated: now };
+fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+' "$KNOWN_MKT" "$MARKETPLACE_NAME" "$REPO" "$MKT_DIR" "$NOW" || warn "Could not update known_marketplaces.json (non-fatal)"
 
 # --- Done ---
 echo ""
