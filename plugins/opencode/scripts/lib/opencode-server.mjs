@@ -3,6 +3,8 @@
 import { OpenCode } from "@opencode/client";
 import { Service } from "@opencode/client/service";
 import { setTimeout as delay } from "node:timers/promises";
+import { usageError } from "./errors.mjs";
+import { opencodeServiceCommand } from "./process.mjs";
 
 const REQUEST_TIMEOUT_MS = Number(process.env.OPENCODE_REQUEST_TIMEOUT_MS) || 1_800_000;
 const PROMPT_TIMEOUT_MS = Number(process.env.OPENCODE_PROMPT_TIMEOUT_MS) || 14_400_000;
@@ -34,7 +36,10 @@ export async function isServerRunning() {
 }
 
 export async function ensureServer() {
-  const endpoint = explicitEndpoint() ?? await Service.ensure({ version: (v) => v.startsWith("2.") });
+  const endpoint = explicitEndpoint() ?? await Service.ensure({
+    version: (v) => v.startsWith("2."),
+    command: opencodeServiceCommand(),
+  });
   const info = await createClient(endpoint.url, { headers: Service.headers(endpoint) }).health();
   if (!info.version.startsWith("2.")) {
     throw new Error(`OpenCode V2 is required (server reports ${info.version}).`);
@@ -42,12 +47,57 @@ export async function ensureServer() {
   return endpoint;
 }
 
-function parseModel(model) {
+/**
+ * Parse "provider/model" or "provider/model#variant".
+ * @param {string|object|undefined} model
+ */
+export function parseModel(model) {
   if (typeof model !== "string") return model;
   const slash = model.indexOf("/");
   const [id, variant] = model.slice(slash + 1).split("#");
-  if (slash < 1 || !id) throw new Error("Model must be provider/model or provider/model#variant.");
+  if (slash < 1 || !id) {
+    throw usageError(`Invalid model "${model}". Use provider/model or provider/model#variant.`);
+  }
   return { providerID: model.slice(0, slash), id, ...(variant ? { variant } : {}) };
+}
+
+/**
+ * Format a V2 model reference as "provider/model#variant".
+ * @param {{ providerID?: string, id?: string, variant?: string }|undefined|null} ref
+ * @returns {string|null}
+ */
+export function formatModel(ref) {
+  if (!ref?.providerID || !ref?.id) return null;
+  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ""}`;
+}
+
+/**
+ * Check a model reference against the server's model list. Skipped when the
+ * list cannot be read, so validation never blocks a working setup.
+ * @param {{ listModels: () => Promise<{ data?: object[] }> }} client
+ * @param {string} model
+ */
+export async function validateModel(client, model) {
+  const ref = parseModel(model);
+  let models;
+  try {
+    models = (await client.listModels()).data;
+  } catch {
+    return;
+  }
+  if (!Array.isArray(models) || models.length === 0) return;
+  const match = models.find((m) => m.providerID === ref.providerID && (m.id === ref.id || m.modelID === ref.id));
+  if (!match) {
+    const providers = [...new Set(models.map((m) => m.providerID))].sort();
+    const hint = providers.includes(ref.providerID)
+      ? `Provider "${ref.providerID}" has no model "${ref.id}". Run "opencode models" to list model ids.`
+      : `Unknown provider "${ref.providerID}". Configured providers: ${providers.join(", ")}.`;
+    throw usageError(`Unknown model "${model}". ${hint}`);
+  }
+  const variants = (match.variants ?? []).map((v) => v.id);
+  if (ref.variant && variants.length > 0 && !variants.includes(ref.variant)) {
+    throw usageError(`Model "${ref.providerID}/${ref.id}" has no variant "${ref.variant}". Variants: ${variants.join(", ")}.`);
+  }
 }
 
 export function extractResponseText(message) {
@@ -98,15 +148,12 @@ export function createClient(baseUrl, opts = {}) {
   const client = {
     baseUrl,
     health: () => native.server.info({ signal: AbortSignal.timeout(3_000) }),
-    listSessions: () => native.session.list({ directory: opts.directory }, requestOptions()),
     createSession: ({ readOnly = false, allowShell = false, allowSubagent = false, model, ...input } = {}) => native.session.create({
       ...input, location, model: parseModel(model),
       permissions: headlessPermissions(readOnly, allowedActions({ allowShell, allowSubagent })),
     }, requestOptions()),
     getSession: (sessionID) => native.session.get({ sessionID }, requestOptions()),
-    deleteSession: (sessionID) => native.session.remove({ sessionID }, requestOptions()),
     abortSession: (sessionID) => native.session.interrupt({ sessionID, resume: false }, { signal: AbortSignal.timeout(10_000) }),
-    getSessionStatus: () => native.session.active(requestOptions()),
     getSessionDiff: (sessionID) => native.session.diff({ sessionID }, requestOptions()),
     getMessages: async (sessionID, options = {}) => {
       const page = await native.message.list({ sessionID, order: "desc", ...options }, requestOptions());
@@ -114,8 +161,7 @@ export function createClient(baseUrl, opts = {}) {
     },
     listAgents: () => native.agent.list({ location }, requestOptions()),
     listProviders: () => native.provider.list({ location }, requestOptions()),
-    getConfig: () => native.config.get({ location }, requestOptions()),
-    subscribeEvents: (options) => native.event.subscribe(options),
+    listModels: () => native.model.list({ location }, { signal: AbortSignal.timeout(10_000) }),
     vcsBase: async () => (await native.vcs.base({ location }, requestOptions())).data,
     vcsStatus: async () => (await native.vcs.status({ location }, requestOptions())).data ?? [],
 
