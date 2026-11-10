@@ -3,6 +3,8 @@
 // JSON state file, per-job files and logs.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, readJson, writeJson } from "./fs.mjs";
@@ -37,35 +39,42 @@ function deriveOwnDataDir() {
 }
 
 /**
- * Compute the state directory root for a workspace.
+ * The companion's data directory.
  *
  * Priority:
  *   1. Explicit opt-in via OPENCODE_COMPANION_DATA (per-plugin override)
  *   2. Self-derived path from script location (correct under normal install)
  *   3. Only trust CLAUDE_PLUGIN_DATA when it already names our own plugin —
  *      otherwise ignore it (another plugin may have exported it into our env)
- *   4. Fallback: /tmp/opencode-companion
+ *   4. Fallback: <os tmpdir>/opencode-companion
  *
+ * @returns {string}
+ */
+export function dataRoot() {
+  if (process.env.OPENCODE_COMPANION_DATA) return process.env.OPENCODE_COMPANION_DATA;
+  const own = deriveOwnDataDir();
+  if (own) return own;
+  const envData = process.env.CLAUDE_PLUGIN_DATA;
+  if (envData && /opencode/i.test(path.basename(envData))) return envData;
+  return path.join(os.tmpdir(), "opencode-companion");
+}
+
+/**
+ * The directory that holds one state folder per workspace.
+ * @returns {string}
+ */
+export function stateBase() {
+  return path.join(dataRoot(), "state");
+}
+
+/**
+ * Compute the state directory root for a workspace.
  * @param {string} workspacePath
  * @returns {string}
  */
 export function stateRoot(workspacePath) {
-  let base;
-  if (process.env.OPENCODE_COMPANION_DATA) {
-    base = path.join(process.env.OPENCODE_COMPANION_DATA, "state");
-  } else {
-    const own = deriveOwnDataDir();
-    const envData = process.env.CLAUDE_PLUGIN_DATA;
-    if (own) {
-      base = path.join(own, "state");
-    } else if (envData && /opencode/i.test(path.basename(envData))) {
-      base = path.join(envData, "state");
-    } else {
-      base = path.join("/tmp", "opencode-companion");
-    }
-  }
   const hash = crypto.createHash("sha256").update(workspacePath).digest("hex").slice(0, 16);
-  return path.join(base, hash);
+  return path.join(stateBase(), hash);
 }
 
 /**
@@ -95,7 +104,52 @@ export function loadState(workspacePath) {
  */
 export function saveState(workspacePath, state) {
   const root = stateRoot(workspacePath);
-  writeJson(stateFile(root), state);
+  writeJson(stateFile(root), { ...state, workspace: workspacePath });
+}
+
+/**
+ * Read every workspace state under the state base. States written before the
+ * workspace path was recorded are skipped: their workspace cannot be known.
+ * @returns {{ workspace: string, jobs: object[] }[]}
+ */
+export function listWorkspaceStates() {
+  let entries;
+  try {
+    entries = fs.readdirSync(stateBase(), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => readJson(stateFile(path.join(stateBase(), entry.name))))
+    .filter((state) => typeof state?.workspace === "string")
+    .map((state) => ({ workspace: state.workspace, jobs: state.jobs ?? [] }));
+}
+
+/**
+ * Path to the plugin-wide settings file (not tied to a workspace).
+ * @returns {string}
+ */
+function pluginConfigFile() {
+  return path.join(dataRoot(), "config.json");
+}
+
+/**
+ * @returns {{ model?: string }}
+ */
+export function loadPluginConfig() {
+  return readJson(pluginConfigFile()) ?? {};
+}
+
+/**
+ * @param {(config: { model?: string }) => void} mutator
+ * @returns {{ model?: string }}
+ */
+export function updatePluginConfig(mutator) {
+  const config = loadPluginConfig();
+  mutator(config);
+  writeJson(pluginConfigFile(), config);
+  return config;
 }
 
 /**

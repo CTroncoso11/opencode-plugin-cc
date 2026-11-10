@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createTmpDir, cleanupTmpDir, setupTestEnv } from "./helpers.mjs";
-import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot } from "../plugins/opencode/scripts/lib/state.mjs";
+import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot, listWorkspaceStates, loadPluginConfig, updatePluginConfig } from "../plugins/opencode/scripts/lib/state.mjs";
 
 let tmpDir;
 const workspace = "/test/workspace";
@@ -25,7 +25,21 @@ describe("state", () => {
     const data = { config: { reviewGate: true }, jobs: [{ id: "test-1" }] };
     saveState(workspace, data);
     const loaded = loadState(workspace);
-    assert.deepEqual(loaded, data);
+    assert.deepEqual(loaded, { ...data, workspace });
+  });
+
+  it("listWorkspaceStates finds every workspace that recorded its path", () => {
+    upsertJob("/workspace/a", { id: "task-a" });
+    upsertJob("/workspace/b", { id: "task-b" });
+    const found = listWorkspaceStates().map((s) => [s.workspace, s.jobs.map((j) => j.id)]).sort();
+    assert.deepEqual(found, [["/workspace/a", ["task-a"]], ["/workspace/b", ["task-b"]]]);
+  });
+
+  it("plugin config is shared by all workspaces", () => {
+    updatePluginConfig((config) => {
+      config.model = "vendor/model";
+    });
+    assert.deepEqual(loadPluginConfig(), { model: "vendor/model" });
   });
 
   it("updateState applies mutator", () => {
