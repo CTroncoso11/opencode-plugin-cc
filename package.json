@@ -6,11 +6,15 @@
   "description": "Use OpenCode from Claude Code to review code or delegate tasks.",
   "license": "MIT",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.0.0",
+    "bun": ">=1.4.0"
   },
-  "workspaces": ["plugins/opencode"],
+  "workspaces": [
+    "plugins/opencode"
+  ],
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:bun": "bun test --timeout 60000 tests/"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

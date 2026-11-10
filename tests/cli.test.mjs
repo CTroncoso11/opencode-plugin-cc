@@ -246,7 +246,7 @@ test("prompt timeout cancels an in-flight V2 request and interrupts server execu
   const run = cli(t, baseUrl, { OPENCODE_PROMPT_TIMEOUT_MS: "100" });
   const result = await run("task", "Run task");
   assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /timeout/i);
+  assert.match(result.stderr, /time(d )?out/i);
   assert.match(result.stdout, /- \*\*Status\*\*: failed/);
   assert.equal(calls.filter((c) => c.path.endsWith("/interrupt")).length, 1);
 });
