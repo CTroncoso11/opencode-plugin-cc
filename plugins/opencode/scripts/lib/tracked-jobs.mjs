@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, appendLine } from "./fs.mjs";
-import { generateJobId, upsertJob, jobLogPath, jobDataPath } from "./state.mjs";
+import { generateJobId, upsertJob, loadState, jobLogPath, jobDataPath } from "./state.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
 
@@ -15,6 +15,10 @@ export function getClaudeSessionId() {
   return process.env[SESSION_ID_ENV] || process.env.CLAUDE_SESSION_ID;
 }
 
+function currentStatus(workspacePath, jobId) {
+  return loadState(workspacePath).jobs?.find((j) => j.id === jobId)?.status;
+}
+
 /**
  * Create a new job record.
  * @param {string} workspacePath
@@ -23,13 +27,12 @@ export function getClaudeSessionId() {
  * @returns {object} the created job
  */
 export function createJobRecord(workspacePath, type, meta = {}) {
-  const id = generateJobId(type);
-  const sessionId = getClaudeSessionId();
   const job = {
-    id,
+    id: generateJobId(type),
     type,
     status: "pending",
-    sessionId,
+    sessionId: getClaudeSessionId(),
+    workspace: workspacePath,
     ...meta,
   };
   upsertJob(workspacePath, job);
@@ -37,78 +40,58 @@ export function createJobRecord(workspacePath, type, meta = {}) {
 }
 
 /**
- * Run a tracked job with full lifecycle management.
+ * Run a tracked job with full lifecycle management. Progress goes to the
+ * job log only; stdout and stderr stay free for the caller.
  * @param {string} workspacePath
- * @param {object} job
+ * @param {{ id: string }} job
  * @param {(ctx: { report: Function, log: Function }) => Promise<object>} runner
  * @returns {Promise<object>} the job result
  */
 export async function runTrackedJob(workspacePath, job, runner) {
-  // Mark as running
+  if (currentStatus(workspacePath, job.id) === "cancelled") {
+    throw new Error(`Job ${job.id} was cancelled before it started.`);
+  }
   upsertJob(workspacePath, { id: job.id, status: "running", pid: process.pid });
 
   const logFile = jobLogPath(workspacePath, job.id);
   ensureDir(path.dirname(logFile));
 
-  const report = (phase, message) => {
-    const line = `[${new Date().toISOString()}] [${phase}] ${message}`;
-    appendLine(logFile, line);
-    process.stderr.write(line + "\n");
-    upsertJob(workspacePath, { id: job.id, phase });
-  };
-
   const log = (message) => {
     appendLine(logFile, `[${new Date().toISOString()}] ${message}`);
+  };
+  const report = (phase, message) => {
+    log(`[${phase}] ${message}`);
+    upsertJob(workspacePath, { id: job.id, phase });
   };
 
   try {
     report("starting", `Job ${job.id} started`);
     const result = await runner({ report, log });
 
-    // Mark as completed
-    upsertJob(workspacePath, {
-      id: job.id,
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      result: result?.rendered ?? result?.summary ?? null,
-    });
-
-    // Write result data file
     const dataFile = jobDataPath(workspacePath, job.id);
     ensureDir(path.dirname(dataFile));
     fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), "utf8");
 
-    report("completed", `Job ${job.id} completed`);
-    return result;
-  } catch (err) {
     upsertJob(workspacePath, {
       id: job.id,
-      status: "failed",
+      status: "completed",
+      phase: "completed",
       completedAt: new Date().toISOString(),
-      errorMessage: err.message,
+      result: result?.summary ?? null,
     });
-    report("failed", `Job ${job.id} failed: ${err.message}`);
+    log(`[completed] Job ${job.id} completed`);
+    return result;
+  } catch (err) {
+    if (currentStatus(workspacePath, job.id) !== "cancelled") {
+      upsertJob(workspacePath, {
+        id: job.id,
+        status: "failed",
+        phase: "failed",
+        completedAt: new Date().toISOString(),
+        errorMessage: err.message,
+      });
+    }
+    log(`[failed] Job ${job.id} failed: ${err.message}`);
     throw err;
   }
-}
-
-/**
- * Create a progress reporter for a job.
- * @param {string} workspacePath
- * @param {string} jobId
- * @returns {{ report: Function, log: Function }}
- */
-export function createProgressReporter(workspacePath, jobId) {
-  const logFile = jobLogPath(workspacePath, jobId);
-
-  return {
-    report(phase, message) {
-      const line = `[${new Date().toISOString()}] [${phase}] ${message}`;
-      appendLine(logFile, line);
-      upsertJob(workspacePath, { id: jobId, phase });
-    },
-    log(message) {
-      appendLine(logFile, `[${new Date().toISOString()}] ${message}`);
-    },
-  };
 }

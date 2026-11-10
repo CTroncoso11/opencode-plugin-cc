@@ -1,7 +1,28 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
 import { tailLines } from "./fs.mjs";
-import { jobLogPath } from "./state.mjs";
+import { jobLogPath, listWorkspaceStates, loadState } from "./state.mjs";
+
+// "starting", "investigating" and "finalizing" are phases that older records
+// stored as statuses; they still mean the job has not finished.
+const ACTIVE_STATUSES = new Set(["pending", "queued", "running", "starting", "investigating", "finalizing"]);
+const FINISHED_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * @param {object|null|undefined} job
+ * @returns {boolean}
+ */
+export function isActiveJob(job) {
+  return ACTIVE_STATUSES.has(job?.status);
+}
+
+/**
+ * @param {object|null|undefined} job
+ * @returns {boolean}
+ */
+export function isFinishedJob(job) {
+  return FINISHED_STATUSES.has(job?.status);
+}
 
 /**
  * Sort jobs newest first by updatedAt.
@@ -32,7 +53,7 @@ export function enrichJob(job, workspacePath) {
   }
 
   // Progress preview from log tail
-  if (job.status === "running") {
+  if (isActiveJob(job)) {
     const logFile = jobLogPath(workspacePath, job.id);
     const lines = tailLines(logFile, 3);
     if (lines.length > 0) {
@@ -41,11 +62,43 @@ export function enrichJob(job, workspacePath) {
   }
 
   // Infer phase from log
-  if (job.status === "running" && !job.phase) {
+  if (isActiveJob(job) && !job.phase) {
     enriched.phase = inferPhase(job, workspacePath);
   }
 
   return enriched;
+}
+
+/**
+ * The stable public shape of a job, used by `status --json`. Every key is
+ * always present; unknown values are null. Internal fields (prompt text, pid)
+ * are left out.
+ * @param {object} job - an enriched job
+ * @param {string} workspacePath
+ * @returns {object}
+ */
+export function toJobView(job, workspacePath) {
+  return {
+    id: job.id,
+    type: job.type ?? null,
+    status: job.status ?? null,
+    phase: job.phase ?? null,
+    agent: job.agent ?? null,
+    model: job.model ?? null,
+    workspace: job.workspace ?? workspacePath,
+    opencodeSessionId: job.opencodeSessionId ?? null,
+    claudeSessionId: job.sessionId ?? null,
+    createdAt: job.createdAt ?? null,
+    updatedAt: job.updatedAt ?? null,
+    completedAt: job.completedAt ?? null,
+    elapsedMs: job.elapsedMs ?? null,
+    elapsed: job.elapsed ?? null,
+    filesChanged: job.filesChanged ?? null,
+    errorMessage: job.errorMessage ?? null,
+    logFile: job.logFile ?? jobLogPath(workspacePath, job.id),
+    progressPreview: job.progressPreview ?? null,
+    breadcrumb: job.breadcrumb ?? null,
+  };
 }
 
 /**
@@ -85,8 +138,8 @@ export function buildStatusSnapshot(jobs, workspacePath, opts = {}) {
   const sorted = sortJobsNewestFirst(filtered);
   const enriched = sorted.map((j) => enrichJob(j, workspacePath));
 
-  const running = enriched.filter((j) => j.status === "running");
-  const finished = enriched.filter((j) => j.status !== "running");
+  const running = enriched.filter(isActiveJob);
+  const finished = enriched.filter((j) => !isActiveJob(j));
   const latestFinished = finished[0] ?? null;
   const recent = finished.slice(0, 5);
 
@@ -115,13 +168,33 @@ export function matchJobReference(jobs, ref) {
 }
 
 /**
- * Resolve a job that has finished (completed or failed).
+ * Find a job by ID or prefix: first in `workspace`, then in every other
+ * workspace the companion has state for. A job started from another folder
+ * is found without --cwd.
+ * @param {string} ref
+ * @param {string} workspace
+ * @returns {{ job: object|null, workspace: string, ambiguous: boolean }}
+ */
+export function locateJob(ref, workspace) {
+  const local = matchJobReference(loadState(workspace).jobs ?? [], ref);
+  if (local.job || local.ambiguous) return { ...local, workspace };
+
+  const others = listWorkspaceStates()
+    .filter((entry) => entry.workspace !== workspace)
+    .flatMap((entry) => entry.jobs.map((job) => ({ job, workspace: entry.workspace })));
+  const found = matchJobReference(others.map((entry) => entry.job), ref);
+  const owner = found.job ? others.find((entry) => entry.job === found.job).workspace : workspace;
+  return { ...found, workspace: owner };
+}
+
+/**
+ * Resolve a job that has finished (completed, failed or cancelled).
  * @param {object[]} jobs
  * @param {string} [ref]
  * @returns {{ job: object|null, ambiguous: boolean }}
  */
 export function resolveResultJob(jobs, ref) {
-  const finished = jobs.filter((j) => j.status === "completed" || j.status === "failed");
+  const finished = jobs.filter(isFinishedJob);
   if (!ref) {
     const sorted = sortJobsNewestFirst(finished);
     return { job: sorted[0] ?? null, ambiguous: false };
@@ -130,13 +203,13 @@ export function resolveResultJob(jobs, ref) {
 }
 
 /**
- * Resolve a job that can be canceled (running).
+ * Resolve a job that can be canceled (not finished yet).
  * @param {object[]} jobs
  * @param {string} [ref]
  * @returns {{ job: object|null, ambiguous: boolean }}
  */
 export function resolveCancelableJob(jobs, ref) {
-  const running = jobs.filter((j) => j.status === "running");
+  const running = jobs.filter(isActiveJob);
   if (!ref) {
     return { job: running[0] ?? null, ambiguous: running.length > 1 };
   }
@@ -158,4 +231,19 @@ function formatDuration(ms) {
   const h = Math.floor(m / 60);
   const rm = m % 60;
   return `${h}h ${rm}m`;
+}
+
+/**
+ * The newest task job that has an OpenCode session, limited to the current
+ * Claude session when its ID is known.
+ * @param {object[]} jobs
+ * @param {string|undefined} claudeSessionId
+ * @param {(job: object) => boolean} [accept] - extra filter, e.g. on status
+ * @returns {object|null}
+ */
+export function latestTaskSession(jobs, claudeSessionId, accept = () => true) {
+  const candidates = (jobs ?? []).filter((j) =>
+    j.type === "task" && j.opencodeSessionId &&
+    (!claudeSessionId || j.sessionId === claudeSessionId) && accept(j));
+  return sortJobsNewestFirst(candidates)[0] ?? null;
 }

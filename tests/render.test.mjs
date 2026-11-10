@@ -51,3 +51,26 @@ describe("renderResult", () => {
     assert.ok(output.includes("Connection timeout"));
   });
 });
+
+describe("renderResult header", () => {
+  it("always lists agent, model, duration, session and changed files", () => {
+    const output = renderResult(
+      { id: "task-3", type: "task", status: "completed", elapsed: "12s", agent: "plan", model: "deepseek/deepseek-flash",
+        opencodeSessionId: "ses_1", workspace: "/repo",
+        filesChanged: { files: ["a.js"], stat: " a.js | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)" } },
+      { rendered: "done" },
+    );
+    for (const line of ["- **Agent**: plan", "- **Model**: deepseek/deepseek-flash", "- **Duration**: 12s",
+      "- **OpenCode Session**: ses_1", "- **Files Changed**: 1 file changed, 1 insertion(+), 1 deletion(-)", " a.js | 2 +-"]) {
+      assert.ok(output.includes(line), line);
+    }
+  });
+
+  it("says unknown or none instead of leaving fields out", () => {
+    const output = renderResult({ id: "task-4", type: "task", status: "completed", filesChanged: { files: [], stat: "" } }, null);
+    assert.ok(output.includes("- **Model**: agent default"));
+    assert.ok(output.includes("- **OpenCode Session**: none"));
+    assert.ok(output.includes("- **Files Changed**: none"));
+    assert.ok(output.includes("(No output captured)"));
+  });
+});

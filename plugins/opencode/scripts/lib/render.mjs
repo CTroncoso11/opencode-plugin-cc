@@ -46,53 +46,55 @@ export function renderStatus(snapshot) {
 }
 
 /**
- * Render a job result as human-readable text.
+ * Describe the files a job changed.
  * @param {object} job
+ * @param {object} [resultData]
+ * @returns {{ summary: string, stat: string|null, files: string[] }}
+ */
+function describeChanges(job, resultData) {
+  const changes = job.filesChanged ?? resultData?.filesChanged;
+  const files = changes?.files ?? resultData?.changedFiles ?? null;
+  if (!files) return { summary: "unknown", stat: null, files: [] };
+  if (files.length === 0) return { summary: "none", stat: null, files };
+  const stat = changes?.stat || null;
+  const summary = stat ? stat.split("\n").pop().trim() : `${files.length} file(s)`;
+  return { summary, stat, files };
+}
+
+/**
+ * Render a job result as the terminal report. The header always lists
+ * status, agent, model, duration, OpenCode session and changed files.
+ * @param {object} job - an enriched job
  * @param {object} [resultData]
  * @returns {string}
  */
 export function renderResult(job, resultData) {
-  const lines = [];
+  const changes = describeChanges(job, resultData);
+  const lines = [
+    `## Job: ${job.id}`,
+    "",
+    `- **Type**: ${job.type ?? "unknown"}`,
+    `- **Status**: ${job.status}`,
+    `- **Agent**: ${job.agent ?? "unknown"}`,
+    `- **Model**: ${job.model ?? "agent default"}`,
+    `- **Duration**: ${job.elapsed ?? "unknown"}`,
+    `- **OpenCode Session**: ${job.opencodeSessionId ?? "none"}`,
+    `- **Workspace**: ${job.workspace ?? "unknown"}`,
+    `- **Files Changed**: ${changes.summary}`,
+    "",
+  ];
 
-  lines.push(`## Job: ${job.id}\n`);
-  lines.push(`- **Type**: ${job.type}`);
-  lines.push(`- **Status**: ${job.status}`);
-  lines.push(`- **Duration**: ${job.elapsed ?? "unknown"}`);
-
-  if (job.opencodeSessionId) {
-    lines.push(`- **OpenCode Session**: ${job.opencodeSessionId}`);
+  if (job.status === "failed" || job.status === "cancelled") {
+    lines.push("### Error", "", job.errorMessage ?? "Unknown error");
+  } else {
+    const output = resultData?.rendered ?? resultData?.summary ?? job.result;
+    lines.push("### Output", "", output || "(No output captured)");
   }
 
-  lines.push("");
-
-  if (job.status === "failed") {
-    lines.push(`### Error\n\n${job.errorMessage ?? "Unknown error"}`);
-  } else if (resultData) {
-    if (resultData.rendered) {
-      lines.push(`### Output\n\n${resultData.rendered}`);
-    } else if (resultData.messages) {
-      // Extract the last assistant message
-      const messages = Array.isArray(resultData.messages) ? resultData.messages : [resultData.messages];
-      const assistantMsgs = messages.filter((m) => m.type === "assistant" || m.role === "assistant");
-      const last = assistantMsgs[assistantMsgs.length - 1];
-      if (last) {
-        const text = extractMessageText(last);
-        lines.push(`### Output\n\n${text}`);
-      }
-    } else if (resultData.summary) {
-      lines.push(`### Summary\n\n${resultData.summary}`);
-    } else {
-      lines.push("### Output\n\n(No output captured)");
-    }
-
-    if (resultData.changedFiles?.length > 0) {
-      lines.push(`\n### Changed Files\n`);
-      for (const f of resultData.changedFiles) {
-        lines.push(`- ${f}`);
-      }
-    }
-  } else if (job.result) {
-    lines.push(`### Output\n\n${job.result}`);
+  if (changes.stat) {
+    lines.push("", "### Changed Files", "", "```", changes.stat, "```");
+  } else if (changes.files.length > 0) {
+    lines.push("", "### Changed Files", "", ...changes.files.map((f) => `- ${f}`));
   }
 
   return lines.join("\n");
@@ -107,28 +109,6 @@ export function renderResult(job, resultData) {
 export function renderNativeReview(text, target) {
   const body = String(text ?? "").trim() || "OpenCode review completed without any output.";
   return [`# OpenCode Review`, "", `Target: ${target.label}`, "", body, ""].join("\n");
-}
-
-/**
- * Extract text content from a message object.
- * @param {object} msg
- * @returns {string}
- */
-function extractMessageText(msg) {
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.parts)) {
-    return msg.parts
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("\n");
-  }
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("\n");
-  }
-  return JSON.stringify(msg);
 }
 
 /**

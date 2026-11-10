@@ -22,7 +22,9 @@ import path from "node:path";
 
 import { ensureDir } from "./fs.mjs";
 import { upsertJob, jobDataPath } from "./state.mjs";
-import { connect, createClient } from "./opencode-server.mjs";
+import { connect, createClient, formatModel } from "./opencode-server.mjs";
+import { isActiveJob } from "./job-control.mjs";
+import { worktreeChanges } from "./git.mjs";
 
 /**
  * Query V2 session completion without starting an unavailable service.
@@ -118,12 +120,11 @@ function toEpochMs(v) {
  */
 export async function autoHealJob(workspace, job, opts = {}) {
   const dryRun = !!opts.dryRun;
-  const HEALABLE = new Set(["starting", "investigating", "running", "finalizing"]);
 
   if (!job || !job.opencodeSessionId) {
     return { job, action: "skip", reason: "no opencodeSessionId" };
   }
-  if (!HEALABLE.has(job.status)) {
+  if (!isActiveJob(job)) {
     return { job, action: "skip", reason: `status=${job.status} not healable` };
   }
 
@@ -175,12 +176,15 @@ export async function autoHealJob(workspace, job, opts = {}) {
 
     upsertJob(workspace, {
       id: job.id,
+      filesChanged: await worktreeChanges(workspace, job.worktreeBefore),
       status: "completed",
       completedAt: completedIso,
       phase: "completed",
       result: summary || job.result || null,
       healed: true,
       finish: probe.finish,
+      model: formatModel(probe.message?.model) ?? job.model ?? null,
+      agent: probe.message?.agent ?? job.agent ?? null,
     });
     return {
       job: { ...job, status: "completed", completedAt: completedIso, result: summary, healed: true, finish: probe.finish },
@@ -196,6 +200,15 @@ export async function autoHealJob(workspace, job, opts = {}) {
   }
 
   return { job, action: "skip", reason: "session has not completed this job" };
+}
+
+/**
+ * Jobs that may have finished on the server without the companion noticing.
+ * @param {object[]} jobs
+ * @returns {object[]}
+ */
+export function healableJobs(jobs) {
+  return (jobs ?? []).filter((j) => j.opencodeSessionId && isActiveJob(j));
 }
 
 /**
