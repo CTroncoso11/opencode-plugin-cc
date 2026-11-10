@@ -1,47 +1,28 @@
 #!/usr/bin/env node
 
 // Session lifecycle hook for the OpenCode companion.
-// Called on SessionStart and SessionEnd events to manage the OpenCode server.
+// Called on SessionEnd to close out jobs whose worker process is gone.
 
 import process from "node:process";
-import { isServerRunning } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
-import { loadState } from "./lib/state.mjs";
+import { loadState, upsertJob } from "./lib/state.mjs";
+import { isActiveJob } from "./lib/job-control.mjs";
+import { isProcessAlive } from "./lib/process.mjs";
 
-const event = process.argv[2]; // "SessionStart" or "SessionEnd"
+const event = process.argv[2];
 
 async function main() {
+  if (event !== "SessionEnd") return;
   const workspace = await resolveWorkspace();
-
-  if (event === "SessionStart") {
-    // Check if OpenCode server is available (but don't auto-start it)
-    const running = await isServerRunning();
-    if (running) {
-      process.stderr.write("[opencode-companion] OpenCode server detected.\n");
-    }
-  }
-
-  if (event === "SessionEnd") {
-    // Clean up: check for any orphaned running jobs and mark them as failed
-    const state = loadState(workspace);
-    const runningJobs = (state.jobs ?? []).filter((j) => j.status === "running");
-
-    for (const job of runningJobs) {
-      if (job.pid) {
-        try {
-          // Check if process is still alive
-          process.kill(job.pid, 0);
-        } catch {
-          // Process is gone, mark job as failed
-          const { upsertJob } = await import("./lib/state.mjs");
-          upsertJob(workspace, {
-            id: job.id,
-            status: "failed",
-            completedAt: new Date().toISOString(),
-            errorMessage: "Session ended while job was running",
-          });
-        }
-      }
+  const state = loadState(workspace);
+  for (const job of (state.jobs ?? []).filter(isActiveJob)) {
+    if (job.pid && !isProcessAlive(job.pid)) {
+      upsertJob(workspace, {
+        id: job.id,
+        status: "failed",
+        completedAt: new Date().toISOString(),
+        errorMessage: "Session ended while job was running",
+      });
     }
   }
 }

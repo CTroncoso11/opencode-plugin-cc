@@ -10,10 +10,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
+import { isActiveJob } from "./lib/job-control.mjs";
 import { isServerRunning, connect, extractResponseText } from "./lib/opencode-server.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
-const ACTIVE_JOB = new Set(["pending", "queued", "running", "starting", "investigating", "finalizing"]);
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -23,7 +23,7 @@ function readHookInput() {
 
 function runningTaskNote(state, sessionId) {
   const jobs = state.jobs ?? [];
-  const running = jobs.find((job) => ACTIVE_JOB.has(job.status) && (!sessionId || job.sessionId === sessionId));
+  const running = jobs.find((job) => isActiveJob(job) && (!sessionId || job.sessionId === sessionId));
   return running
     ? `OpenCode task ${running.id} is still running. Check /opencode:status and use /opencode:cancel ${running.id} if you want to stop it before ending the session.`
     : null;
