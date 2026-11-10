@@ -1,8 +1,8 @@
 ---
 description: Run an OpenCode code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <provider/model>]'
 disable-model-invocation: true
-allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Glob, Grep, Bash(sh:*), Bash(git:*), AskUserQuestion
 ---
 
 Run an OpenCode review through the shared built-in reviewer.
@@ -36,15 +36,17 @@ Argument handling:
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
-- `/opencode:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
+- `/opencode:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text (positional or `--prompt-file`); the companion rejects them with exit code 3.
+- Always pass `--cwd "<repo>"`, where `<repo>` is the absolute path of the repository the user is working in. The Bash tool's working directory may be a different folder.
 - For a review with custom instructions, use `/opencode:delegate --agent plan`.
 
 Foreground flow:
 - Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review $ARGUMENTS
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" review --cwd "<repo>" $ARGUMENTS
 ```
-- Return the command stdout verbatim, exactly as-is.
+- Return the command stdout verbatim, exactly as-is. It is the `## Job:` report (status, agent, model, duration, OpenCode session, files changed) followed by the review.
+- Exit code 0 means the review completed; 1 means it failed (the report shows the error); 3 means bad arguments (one line on stderr).
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
@@ -52,7 +54,7 @@ Background flow:
 - Launch the review with `Bash` in the background:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review $ARGUMENTS`,
+  command: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" review --cwd "<repo>" $ARGUMENTS`,
   description: "OpenCode review",
   run_in_background: true
 })

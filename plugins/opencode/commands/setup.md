@@ -1,13 +1,13 @@
 ---
 description: Check whether the local OpenCode CLI is ready and optionally toggle the stop-time review gate
 argument-hint: '[--enable-review-gate|--disable-review-gate]'
-allowed-tools: Bash(node:*), Bash(npm:*), Bash(brew:*), Bash(curl:*), AskUserQuestion
+allowed-tools: Bash(sh:*), Bash(npm:*), Bash(brew:*), Bash(curl:*), AskUserQuestion
 ---
 
-Run:
+Run, replacing `<repo>` with the absolute path of the repository the user is working in (the review gate setting belongs to that workspace):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" setup --json $ARGUMENTS
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" setup --json --cwd "<repo>" $ARGUMENTS
 ```
 
 If the result says OpenCode is unavailable:
@@ -25,7 +25,7 @@ npm install -g @opencode/cli
 - Then rerun:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" setup --json $ARGUMENTS
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" setup --json --cwd "<repo>" $ARGUMENTS
 ```
 
 If OpenCode is already installed:

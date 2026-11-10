@@ -12,6 +12,6 @@ Reference existing artifacts (plans, specs, issues, commits, diffs) by path or U
 
 Ask for a missing request or ambiguous required context before dispatching.
 
-Invoke `Skill` with `skill: "opencode:opencode-runtime"` and follow its direct dispatch and waiting flow. The skill runs inline and resolves plugin paths without creating a subagent. Pass only the prepared prompt as task text, with the user's routing flags separately. Default to foreground waiting unless `--background` was requested.
+Invoke `Skill` with `skill: "opencode:opencode-runtime"` and follow its direct dispatch and waiting flow. The skill runs inline and resolves plugin paths without creating a subagent. Write the prepared prompt to a file and pass it with `--prompt-file`, with the user's routing flags separately, and always pass `--cwd` with the repository's absolute path. Default to foreground waiting unless `--background` was requested.
 
 Return the companion's terminal OpenCode report verbatim, without commentary. If OpenCode is missing or unauthenticated, direct the user to `/opencode:setup`.

@@ -2,7 +2,7 @@
 
 Use OpenCode from inside Claude Code for code reviews or to delegate tasks.
 This fork of [tasict/opencode-plugin-cc](https://github.com/tasict/opencode-plugin-cc)
-targets **OpenCode V2** and is tested against **2.0.26**. V1 is not supported by
+targets **OpenCode V2** and is tested against **2.2.5** (client `@opencode/client` 2.2.6). V1 is not supported by
 this version; use the upstream project for V1.
 
 > **Tribute:** Inspired by [codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
@@ -18,7 +18,8 @@ Do not add it to OpenCode's `plugins` configuration.
 - [Claude Code](https://claude.com/claude-code)
 - [OpenCode V2](https://opencode.ai/v2/docs/) in your PATH
 - A configured AI provider in OpenCode (open OpenCode and use `/connect`)
-- Node.js **22 or later**, npm, Git, and Python 3 (for the installer)
+- Node.js **22 or later** (always needed by the installer and npm), or Bun **1.4 or later**
+  to run the companion; plus npm, Git and a POSIX `sh` (Git Bash on Windows)
 
 If you already have V2, keep your existing installation and configuration.
 For a new installation:
@@ -71,7 +72,7 @@ if Claude Code cannot find it, add it with
 For a fuller diagnostic:
 
 ```bash
-node ~/.claude/plugins/cache/armedi-opencode-plugin-cc/opencode/2.0.0/scripts/opencode-companion.mjs doctor
+sh ~/.claude/plugins/cache/armedi-opencode-plugin-cc/opencode/2.0.0/scripts/run.sh doctor
 ```
 
 Delegate a task:
@@ -91,16 +92,21 @@ Delegate a task:
 
 | Command | Purpose |
 | --- | --- |
-| `/opencode:review` | OpenCode's built-in `/review`; supports `--base <ref>` and `--scope` |
+| `/opencode:review` | OpenCode's built-in `/review`; supports `--base <ref>`, `--scope` and `--model` |
 | `/opencode:delegate` | Delegate work; supports `--model`, `--agent`, `--resume`, `--fresh`, `--background` |
 | `/opencode:status` | Running/recent jobs for the current repository |
 | `/opencode:result` | Finished output and OpenCode session ID |
 | `/opencode:cancel` | Interrupt the V2 session and stop its companion worker |
 | `/opencode:setup` | Check installation/service/providers and toggle the review gate |
 
-Model references use `provider/model` or `provider/model#variant`. An explicit
-`--model` applies to both foreground and background tasks; otherwise OpenCode
-uses its configured default. Resuming reuses the same OpenCode session.
+Model references use `provider/model` or `provider/model#variant`. The model is
+chosen in this order: `--model`, the `OPENCODE_PLUGIN_MODEL` environment
+variable, the default saved with `companion config --set-model <provider/model>`
+(clear it with `--unset-model`), and finally the model configured for the agent
+in OpenCode. The model is checked against OpenCode's model list before a job is
+created; an unknown provider, model or variant fails with exit code 3. The
+report shows the model and agent OpenCode really used. Resuming reuses the same
+OpenCode session.
 
 Claude prepares the delegation prompt with the context needed for the request,
 referencing existing artifacts by path or URL and including conversation-only
@@ -138,6 +144,44 @@ Enable the optional Stop review gate with `/opencode:setup --enable-review-gate`
 It reviews Claude's response before allowing a stop. It is disabled by default
 and may increase latency and model usage.
 
+## Companion CLI
+
+Claude Code calls the companion through one launcher, `scripts/run.sh`. It runs
+the companion with Bun when `bun` 1.4 or later is on PATH, else with Node 22 or
+later (`OPENCODE_COMPANION_RUNTIME=node|bun` forces one). The hooks use the
+same launcher. Background workers start with the same runtime as the companion.
+
+```bash
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" task --background --cwd /path/to/repo --prompt-file /tmp/prompt.md
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" wait-and-result <task-id> --max-wait 480
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" status <task-id> --json
+```
+
+- `--cwd <dir>` (alias `--workspace <dir>`) works on every subcommand and
+  selects the workspace (its git root). Without it the current directory is used.
+- `status`, `result`, `wait-and-result` and `cancel` find a job by ID (or a
+  unique ID prefix) in any workspace, so they work from any folder.
+- `task` takes the prompt from `--prompt-file <path>`, from stdin with
+  `--prompt-file -`, or as the remaining words. Use `--` before text that starts
+  with `--`. No prompt ever goes through a shell or onto a worker's command line,
+  so quotes, `$`, `&`, `%` and newlines arrive unchanged.
+- `review` runs OpenCode's built-in `/review` and accepts no custom instructions
+  (positional or `--prompt-file`); use `task --agent plan` for that.
+- Unknown options are errors. Errors are one line on stderr.
+- Every finished job prints the same report: status, agent, model, duration,
+  OpenCode session, workspace, files changed (`git diff --stat` of what changed
+  during the job), then the output.
+- `status --json` has a stable, versioned shape (`schemaVersion: 1`); see
+  `plugins/opencode/skills/opencode-result-handling/SKILL.md`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Job failed or was cancelled, or OpenCode returned an error |
+| 2 | Job still running (`wait-and-result` timed out, or `result` on an active job) |
+| 3 | Usage error (unknown option, bad `--cwd`, unreadable prompt file, unknown model) |
+| 4 | Job not found, or the ID prefix is ambiguous |
+
 ## V2 service and job lifecycle
 
 The companion discovers (or starts) the shared local V2 service with
@@ -155,16 +199,19 @@ finished. `companion heal --dry-run --json` previews this reconciliation;
 `--all` includes jobs from other Claude sessions. Unreachable services or sessions
 that are still running are left alone rather than incorrectly marked failed.
 
-Inspect live messages with the V2 CLI (which handles discovery/authentication):
+Inspect live messages with the V2 CLI (which handles discovery/authentication).
+In Git Bash on Windows, `MSYS_NO_PATHCONV=1` keeps the path from being rewritten:
 
 ```bash
-opencode api get /api/session/<session-id>/message
+MSYS_NO_PATHCONV=1 opencode api get /api/session/<session-id>/message
 ```
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `OPENCODE_PLUGIN_MODEL` | Unset | Default model for `task` and `review` when `--model` is not given |
+| `OPENCODE_COMPANION_RUNTIME` | Auto | `node` or `bun` to override the launcher's choice |
 | `OPENCODE_SERVER_URL` | Discovered service | Explicit V2 server URL; never falls back to starting a different server |
 | `OPENCODE_SERVER_PASSWORD` | Unset | Basic authentication for an explicit server |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Basic authentication username for an explicit server |
@@ -173,7 +220,8 @@ opencode api get /api/session/<session-id>/message
 | `OPENCODE_COMPLETION_POLL_MS` | `5000` | Session completion poll interval |
 | `OPENCODE_COMPANION_DATA` | Self-derived | Override plugin data directory |
 
-`companion config --json` prints resolved settings (passwords are redacted).
+`companion config --json` prints resolved settings, including the default model
+and where it comes from (passwords are redacted).
 The old V1 idle/pgrep/strict-terminal environment settings are no longer used.
 
 ## Troubleshooting
@@ -198,9 +246,10 @@ configuration discovery. Existing supported V1 configuration remains compatible.
 
 ```bash
 npm ci
-npm test
-node plugins/opencode/scripts/opencode-companion.mjs setup --json
-node plugins/opencode/scripts/opencode-companion.mjs doctor --json
+npm test            # Node's test runner
+npm run test:bun    # the same suite under Bun (bun test)
+sh plugins/opencode/scripts/run.sh setup --json
+sh plugins/opencode/scripts/run.sh doctor --json
 ```
 
 Runtime dependencies and a standalone lockfile live in `plugins/opencode/` so
